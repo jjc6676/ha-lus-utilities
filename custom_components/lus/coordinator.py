@@ -173,7 +173,11 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
             costs = []
             for meter in meters:
                 meter_costs = await self._async_import_meter(
-                    meter, meter_rates.get(meter.uuid, rates), total_last, recalculate_from
+                    meter,
+                    meter_rates.get(meter.uuid, rates),
+                    total_last,
+                    recalculate_from,
+                    account_rates.cycles,
                 )
                 if meter_costs is not None:
                     costs.append(meter_costs)
@@ -240,6 +244,7 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         rates: Rates | RateSchedule,
         total_last: LastStat,
         recalculate_from: datetime | None = None,
+        account_cycles: int | BillingCycles | None = None,
     ) -> list[HourlyUsage] | None:
         """Import consumption and, for billed meters, cost. Returns the cost hours."""
         consumption_id = statistic_id(meter)
@@ -258,7 +263,11 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
             # The bill sensors need the previous cycle's total cost too.
             resume.append(
                 self._resume_date(
-                    total_last, meter, today, cycles, previous_cycle=True
+                    total_last,
+                    meter,
+                    today,
+                    cycles if account_cycles is None else account_cycles,
+                    previous_cycle=True,
                 )
             )
         fetch_from = min(resume)

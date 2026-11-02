@@ -138,6 +138,15 @@ def quarter_reads(start: datetime, count: int) -> list[Read]:
     return [Read(start + i * step, start + (i + 1) * step, 0.5) for i in range(count)]
 
 
+def hourly_usage(start: datetime, end: datetime, value: float) -> list[HourlyUsage]:
+    hours = []
+    hour = start.astimezone(timezone.utc)
+    while hour < end.astimezone(timezone.utc):
+        hours.append(HourlyUsage(hour.astimezone(SITE_TZ), value))
+        hour += timedelta(hours=1)
+    return hours
+
+
 class FakeClient:
     def __init__(self, reads):
         self.reads = reads
@@ -320,6 +329,93 @@ async def test_update_costs_each_hour_in_its_bill_period(harness):
     cost = next(stats for stat_id, stats in harness.added if stat_id == COST_ID)
     noon = next(s for s in cost if s["start"] == datetime(2026, 10, 20, 12, tzinfo=CDT))
     assert noon["state"] == pytest.approx(2.0 * (0.05224 + 0.050) + 13.00 / (28 * 24))
+
+
+async def test_staggered_meter_cycles_keep_the_account_cycles_first_day(harness, monkeypatch):
+    electric = Meter("elec-uuid", "1000000001", "ELECTRICITY", "HOUR", date(2026, 9, 24))
+    water = Meter("water-uuid", "1000000002", "WATER", "HOUR", date(2026, 9, 24))
+    electric_bills = [
+        (local(2026, 8, 24), local(2026, 9, 24)),
+        (local(2026, 9, 24), local(2026, 10, 24)),
+    ]
+    water_bills = [
+        (local(2026, 8, 25), local(2026, 9, 25)),
+        (local(2026, 9, 25), local(2026, 10, 25)),
+    ]
+    reads = {
+        electric.uuid: [
+            Read(hour.start, hour.start + timedelta(hours=1), hour.value)
+            for hour in hourly_usage(local(2026, 9, 24), local(2026, 10, 28), 1.0)
+        ],
+        water.uuid: [
+            Read(hour.start, hour.start + timedelta(hours=1), hour.value)
+            for hour in hourly_usage(local(2026, 9, 24), local(2026, 10, 28), 10.0)
+        ],
+    }
+    c = harness.make([])
+    requests = {electric.uuid: [], water.uuid: []}
+
+    async def get_reads(meter, start, end):
+        requests[meter.uuid].append((start, end))
+        return [r for r in reads[meter.uuid] if start <= r.start.date() <= end]
+
+    async def get_periods(meter):
+        return electric_bills if meter is electric else water_bills
+
+    async def meters():
+        return [electric, water]
+
+    async def no_op(*args):
+        return None
+
+    c.client.async_get_reads = get_reads
+    c.client.async_get_bill_periods = get_periods
+    c.client.async_get_meters = meters
+    c.client.async_login = no_op
+    c.client.account_id = "5000000000"
+    c._bill_ends = {
+        electric.uuid: electric_bills[-1][1],
+        water.uuid: water_bills[-1][1],
+    }
+    c.hass.config_entries = SimpleNamespace(async_update_entry=lambda *args, **kwargs: None)
+    rates = RateSchedule([(None, Rates(water_tier1_gallons=100_000))])
+    c.config_entry = SimpleNamespace(options={"rate_schedule": rates.as_options()})
+
+    latest = local(2026, 10, 26, 23).timestamp()
+    for meter in (electric, water):
+        harness.last[coord.statistic_id(meter)] = [{"start": latest, "sum": 1.0}]
+        harness.last[coord.cost_statistic_id(meter)] = [{"start": latest, "sum": 1.0}]
+    harness.last[coord.total_cost_statistic_id(c.client.account_id)] = [
+        {"start": latest, "sum": 1.0}
+    ]
+
+    captured = []
+    real_total_costs = coord.total_costs
+
+    def capture_total_costs(costs, account_rates):
+        totals = real_total_costs(costs, account_rates)
+        captured.extend(totals)
+        return totals
+
+    monkeypatch.setattr(coord, "total_costs", capture_total_costs)
+    data = await c._async_update_data()
+
+    # Water's own previous cycle starts on 9/25, but account billing starts on
+    # 9/24. Both meter histories must cover that first account day, and no more.
+    assert requests[electric.uuid] == [
+        (date(2026, 9, 24), date(2026, 10, 23)),
+        (date(2026, 10, 24), date(2026, 10, 27)),
+    ]
+    assert requests[water.uuid] == requests[electric.uuid]
+    assert captured[0].start == local(2026, 9, 24)
+    first_day = [hour for hour in captured if hour.start < local(2026, 9, 25)]
+    assert len(first_day) == 24
+    assert data.previous.cost == pytest.approx(
+        sum(hour.value for hour in captured if local(2026, 9, 24) <= hour.start < local(2026, 10, 24))
+    )
+    assert data.previous.cost > sum(
+        hour.value for hour in captured if local(2026, 9, 25) <= hour.start < local(2026, 10, 24)
+    )
 
 
 async def test_a_failed_update_doesnt_remember_the_bill(harness):
