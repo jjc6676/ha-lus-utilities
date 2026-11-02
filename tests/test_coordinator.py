@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from custom_components.lus import coordinator as coord
-from custom_components.lus.api import LusError, Meter, Read
+from custom_components.lus.api import LusError, Meter, Read, parse_reads
 from custom_components.lus.cost import SITE_TZ, Rates
 
 CDT = timezone(timedelta(hours=-5))
@@ -262,13 +262,13 @@ async def test_malformed_winter_response_is_not_cached_and_retries_next_update(h
             self.requests.append((start, end))
             if self.malformed:
                 self.malformed = False
-                raise LusError("Malformed reads response: missing 'reads'")
+                return parse_reads({"reads": [None]})
             return []
 
     c = harness.make([])
     c.client = MalformedThenEmptyClient()
 
-    with pytest.raises(LusError, match="missing 'reads'"):
+    with pytest.raises(LusError, match=r"read\[0\].*JSON object"):
         await c._async_account_winter_average(
             [WATER], Rates(water_tier1_gallons=20000), date(2026, 10, 27)
         )
