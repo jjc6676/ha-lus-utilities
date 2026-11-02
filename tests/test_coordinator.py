@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from custom_components.lus import coordinator as coord
-from custom_components.lus.api import Meter, Read
+from custom_components.lus.api import LusError, Meter, Read
 from custom_components.lus.cost import SITE_TZ, Rates
 
 CDT = timezone(timedelta(hours=-5))
@@ -250,6 +250,44 @@ async def test_old_no_data_winter_is_cached_after_settle(harness):
     assert first == again == coord.WinterAverageData(2026, "1000000002", None)
     assert winter_requests(c) == WINTER_REQUESTS
     assert c._winters == {}
+
+
+async def test_malformed_winter_response_is_not_cached_and_retries_next_update(harness):
+    class MalformedThenEmptyClient(FakeClient):
+        def __init__(self):
+            super().__init__([])
+            self.malformed = True
+
+        async def async_get_reads(self, meter, start, end):
+            self.requests.append((start, end))
+            if self.malformed:
+                self.malformed = False
+                raise LusError("Malformed reads response: missing 'reads'")
+            return []
+
+    c = harness.make([])
+    c.client = MalformedThenEmptyClient()
+
+    with pytest.raises(LusError, match="missing 'reads'"):
+        await c._async_account_winter_average(
+            [WATER], Rates(water_tier1_gallons=20000), date(2026, 10, 27)
+        )
+
+    assert c._winters == {}
+    assert c._settled_winter_results == {}
+    assert c._winter_results == {}
+
+    c._winter_results = {}  # simulate the next coordinator update
+    again = await c._async_account_winter_average(
+        [WATER], Rates(water_tier1_gallons=20000), date(2026, 10, 27)
+    )
+
+    assert again == coord.WinterAverageData(2026, "1000000002", None)
+    assert c.client.requests == [WINTER_REQUESTS[0], *WINTER_REQUESTS]
+    assert c._winters == {}
+    assert c._settled_winter_results == {
+        ("water-uuid", 23, 2026): (None, False)
+    }
 
 
 async def test_within_settle_incomplete_winter_retries_and_can_complete(harness):

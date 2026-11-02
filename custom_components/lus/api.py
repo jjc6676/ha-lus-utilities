@@ -150,6 +150,7 @@ class LusClient:
                 "includeEnhancedBilling": "false",
                 "includeMultiRegisterData": "false",
             },
+            strict_json=True,
         )
         return parse_reads(body)
 
@@ -161,7 +162,8 @@ class LusClient:
         entities: bool = True,
         account_only: bool = False,
         retry: bool = True,
-    ) -> dict[str, Any]:
+        strict_json: bool = False,
+    ) -> Any:
         if self._token is None:
             raise LusAuthError("Not logged in")
         headers = {
@@ -179,7 +181,7 @@ class LusClient:
         async with self._session.get(
             f"{BASE_URL}/{path}", params=params, headers=headers
         ) as resp:
-            body = await _json(resp)
+            body = await _json(resp, strict=strict_json and resp.status == 200)
             status = resp.status
         if status == 401 and retry:
             # Sessions expire; log in again once and repeat the call.
@@ -190,6 +192,7 @@ class LusClient:
                 entities=entities,
                 account_only=account_only,
                 retry=False,
+                strict_json=strict_json,
             )
         if status == 401:
             raise LusAuthError("Session rejected after re-login")
@@ -199,12 +202,14 @@ class LusClient:
         return body
 
 
-async def _json(resp: aiohttp.ClientResponse) -> dict[str, Any]:
+async def _json(resp: aiohttp.ClientResponse, *, strict: bool = False) -> Any:
     try:
         body = await resp.json(content_type=None)
     except (aiohttp.ContentTypeError, ValueError):
+        if strict:
+            raise LusError("Malformed reads response: body was not valid JSON") from None
         return {}
-    return body if isinstance(body, dict) else {}
+    return body if strict or isinstance(body, dict) else {}
 
 
 def parse_meters(meta: dict[str, Any]) -> list[Meter]:
@@ -227,10 +232,18 @@ def parse_meters(meta: dict[str, Any]) -> list[Meter]:
     return meters
 
 
-def parse_reads(body: dict[str, Any]) -> list[Read]:
+def parse_reads(body: Any) -> list[Read]:
     """Build reads from a DataBrowser reads response, skipping empty intervals."""
+    if not isinstance(body, dict):
+        raise LusError("Malformed reads response: expected a JSON object")
+    if "reads" not in body:
+        raise LusError("Malformed reads response: missing 'reads'")
+    items = body["reads"]
+    if not isinstance(items, list):
+        raise LusError("Malformed reads response: 'reads' must be a list")
+
     reads = []
-    for item in body.get("reads") or []:
+    for item in items:
         value = (item.get("consumption") or {}).get("value")
         if value is None:
             continue

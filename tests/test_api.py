@@ -8,6 +8,7 @@ import pytest
 from custom_components.lus.api import (
     LusAuthError,
     LusClient,
+    LusError,
     Meter,
     Read,
     parse_meters,
@@ -89,6 +90,25 @@ def test_parse_reads_skips_missing_values():
     assert reads[0].value == pytest.approx(0.144)
 
 
+def test_parse_reads_accepts_an_explicit_empty_collection():
+    assert parse_reads({"reads": []}) == []
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (None, "expected a JSON object"),
+        ([], "expected a JSON object"),
+        ({}, "missing 'reads'"),
+        ({"reads": None}, "'reads' must be a list"),
+        ({"reads": {}}, "'reads' must be a list"),
+    ],
+)
+def test_parse_reads_rejects_malformed_payloads(body, message):
+    with pytest.raises(LusError, match=message):
+        parse_reads(body)
+
+
 def test_to_hourly_sums_quarter_hours_and_holds_back_partial_last_hour():
     start = datetime(2026, 10, 26, tzinfo=CDT)
     hours = to_hourly(quarter_reads(start, 4 * 24 + 2), reads_per_hour=4)
@@ -128,11 +148,13 @@ def test_statistic_id_is_valid():
 
 
 class FakeResponse:
-    def __init__(self, status: int, body: dict) -> None:
+    def __init__(self, status: int, body) -> None:
         self.status = status
         self._body = body
 
     async def json(self, content_type=None):
+        if isinstance(self._body, Exception):
+            raise self._body
         return self._body
 
     async def __aenter__(self):
@@ -210,6 +232,25 @@ async def test_login_and_reads_send_expected_headers():
     assert reads["params"]["aggregateType"] == "quarter_hour"
     assert reads["params"]["startDate"] == "2026-10-26"
     assert reads["params"]["endDate"] == "2026-10-27"
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (ValueError("not json"), "not valid JSON"),
+        ("not an object", "expected a JSON object"),
+        ({}, "missing 'reads'"),
+        ({"reads": "not a list"}, "'reads' must be a list"),
+    ],
+)
+async def test_get_reads_rejects_malformed_success_responses(body, message):
+    session = FakeSession(login_responses() + [("GET", READS, 200, body)])
+    client = LusClient(session, "user", "pw")
+    await client.async_login()
+
+    meter = Meter("elec-uuid", "1000000001", "ELECTRICITY", "QUARTER_HOUR", None)
+    with pytest.raises(LusError, match=message):
+        await client.async_get_reads(meter, date(2026, 10, 26), date(2026, 10, 27))
 
 
 async def test_expired_session_logs_in_again_once():
