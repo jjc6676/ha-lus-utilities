@@ -448,8 +448,14 @@ class BillEstimate:
         """The cost so far scaled to the whole cycle, at the same hourly rate."""
         if self.data_through is None:
             return None
-        covered = (self.data_through - self.cycle_start) / timedelta(hours=1)
-        whole = (self.cycle_end - self.cycle_start) / timedelta(hours=1)
+        covered = (
+            self.data_through.astimezone(timezone.utc)
+            - self.cycle_start.astimezone(timezone.utc)
+        ) / timedelta(hours=1)
+        whole = (
+            self.cycle_end.astimezone(timezone.utc)
+            - self.cycle_start.astimezone(timezone.utc)
+        ) / timedelta(hours=1)
         return self.cost * whole / covered if covered > 0 else None
 
 

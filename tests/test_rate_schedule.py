@@ -329,6 +329,22 @@ async def test_a_failed_update_doesnt_remember_the_bill(harness):
     assert c._bill_ends == {}  # so the next update costs that cycle again
 
 
+async def test_malformed_bill_reads_become_update_failed(harness):
+    from custom_components.lus.api import parse_bill_periods
+
+    c, _ = update_harness(harness, [])
+
+    async def malformed_periods(meter):
+        return parse_bill_periods({"reads": {}})
+
+    c.client.async_get_bill_periods = malformed_periods
+
+    with pytest.raises(
+        coord.UpdateFailed, match=r"billing response 'reads' must be a sequence"
+    ):
+        await c._async_update_data()
+
+
 # --- Options flow ----------------------------------------------------------
 
 

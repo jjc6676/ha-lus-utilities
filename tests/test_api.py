@@ -294,6 +294,24 @@ def test_bill_periods_skip_records_with_no_dated_endpoints(item):
     assert parse_bill_periods({"reads": [item]}) == []
 
 
+@pytest.mark.parametrize("body", [{}, {"reads": None}])
+def test_bill_periods_allow_missing_reads(body):
+    from custom_components.lus.api import parse_bill_periods
+
+    assert parse_bill_periods(body) == []
+
+
+@pytest.mark.parametrize(
+    "reads",
+    [False, 0, "", "not a list", b"reads", {}, {"startTime": "ignored"}, object()],
+)
+def test_bill_periods_reject_invalid_reads_container(reads):
+    from custom_components.lus.api import LusError, parse_bill_periods
+
+    with pytest.raises(LusError, match=r"billing response 'reads' must be a sequence"):
+        parse_bill_periods({"reads": reads})
+
+
 async def test_login_and_reads_send_expected_headers():
     session = FakeSession(
         login_responses()

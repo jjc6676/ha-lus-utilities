@@ -5,7 +5,7 @@ Kept free of Home Assistant imports so it can be run and tested on its own.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import json
@@ -261,8 +261,15 @@ def parse_reads(body: dict[str, Any]) -> list[Read]:
 
 def parse_bill_periods(body: dict[str, Any]) -> list[tuple[datetime, datetime]]:
     """Build billing periods from a bill-aggregated reads response."""
+    reads = body.get("reads")
+    if reads is None:
+        return []
+    if not isinstance(reads, Sequence) or isinstance(
+        reads, (str, bytes, bytearray)
+    ):
+        raise LusError("billing response 'reads' must be a sequence")
     periods = []
-    for index, item in enumerate(body.get("reads") or []):
+    for index, item in enumerate(reads):
         if not isinstance(item, Mapping):
             raise LusError(f"billing period {index} must be a mapping")
         start_text = item.get("startTime")

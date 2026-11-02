@@ -138,7 +138,10 @@ total stops leaving out the other meter's charges for them.
 
 **Upgrading to 0.6.0:** sets of rates still holding the old default billing
 day (23) switch to 0, your bills' own dates, and every stored cost is
-recalculated once on the first update. A day you changed yourself is kept.
+recalculated once on the first update. Other days you changed yourself are
+kept. An explicitly chosen historical day 23 is indistinguishable from the old
+default, so it also migrates to your bills' dates; reselect 23 afterward to
+keep using it.
 
 **Not modeled:** taxes (currently $0 on the bill), late fees, payments and
 credits, and any adjustment LUS makes to a winter average for unusual
