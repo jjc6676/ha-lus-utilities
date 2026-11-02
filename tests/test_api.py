@@ -236,6 +236,22 @@ async def test_bill_periods_come_from_the_bill_aggregation_without_dates():
     assert "startDate" not in sent["params"] and "endDate" not in sent["params"]
 
 
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"startTime": "2026-08-21T00:00:00-05:00"},
+        {"endTime": "2026-09-23T00:00:00-05:00"},
+        {"startTime": "not-a-date", "endTime": "2026-09-23T00:00:00-05:00"},
+        {"startTime": "2026-08-21T00:00:00", "endTime": "2026-09-23T00:00:00"},
+    ],
+)
+def test_bill_periods_reject_partial_malformed_or_naive_dates(item):
+    from custom_components.lus.api import LusError, parse_bill_periods
+
+    with pytest.raises(LusError, match="billing period"):
+        parse_bill_periods({"reads": [item]})
+
+
 async def test_login_and_reads_send_expected_headers():
     session = FakeSession(
         login_responses()

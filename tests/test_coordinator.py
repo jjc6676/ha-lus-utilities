@@ -106,7 +106,7 @@ async def test_later_import_continues_sum_after_last_hour(harness):
     assert cost_meta["statistic_id"] == COST_ID
     assert cost_meta["unit_of_measurement"] == "USD"
     assert len(cost) == 18
-    hourly_fixed = 13.00 / (31 * 24)  # 10/23-11/23 cycle
+    hourly_fixed = 13.00 / (31 * 24 + 1)  # 10/23-11/23 crosses the fall DST change
     assert cost[0]["state"] == pytest.approx(2.0 * 0.09624 + hourly_fixed)
     assert cost[0]["sum"] == pytest.approx(10.0 + cost[0]["state"])
 
@@ -161,7 +161,7 @@ async def test_costs_cover_hours_the_meter_skipped(harness):
         s["state"] for s in cost
         if datetime(2026, 10, 23, 5, tzinfo=CDT) <= s["start"] < datetime(2026, 10, 23, 8, tzinfo=CDT)
     ]
-    assert skipped == pytest.approx([13.00 / (31 * 24)] * 3)
+    assert skipped == pytest.approx([13.00 / (31 * 24 + 1)] * 3)
 
 
 def hourly_reads(start: datetime, end: datetime, value: float) -> list[Read]:
@@ -224,7 +224,7 @@ async def test_automatic_tier_limit_reads_last_winter_once(harness):
     assert winters(c) == {("water-uuid", 2026): pytest.approx(limit)}
     # By 10/27 this cycle is past the limit / 0.75: tier 2, wastewater on 75%.
     _, cost = harness.added[1]
-    hourly_fixed = (6.99 + 1.00 + 11.29) / (31 * 24)
+    hourly_fixed = (6.99 + 1.00 + 11.29) / (31 * 24 + 1)
     assert cost[0]["state"] == pytest.approx(400 * 0.00331 + 0.75 * 400 * 0.00747 + hourly_fixed)
 
 

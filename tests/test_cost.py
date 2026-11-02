@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from custom_components.lus.api import HourlyUsage
+from custom_components.lus.api import HourlyUsage, LusError
 from custom_components.lus.cost import (
     SITE_TZ,
     BillingCycles,
@@ -31,8 +31,12 @@ CYCLE_END = datetime(2026, 10, 23, tzinfo=SITE_TZ)
 
 def spread(total: float, start: datetime = CYCLE_START, end: datetime = CYCLE_END) -> list[HourlyUsage]:
     """`total` spread evenly over every hour from start to end."""
-    count = int((end - start) / timedelta(hours=1))
-    return [HourlyUsage(start + timedelta(hours=i), total / count) for i in range(count)]
+    utc_start = start.astimezone(timezone.utc)
+    count = int((end.astimezone(timezone.utc) - utc_start) / timedelta(hours=1))
+    return [
+        HourlyUsage((utc_start + timedelta(hours=i)).astimezone(SITE_TZ), total / count)
+        for i in range(count)
+    ]
 
 
 def test_cycle_bounds():
@@ -43,9 +47,38 @@ def test_cycle_bounds():
     assert (start.month, start.year, end.month, end.year) == (12, 2026, 1, 2027)
 
 
+@pytest.mark.parametrize("day", [29, 30, 31])
+def test_month_end_billing_day_clamps_without_drifting(day: int):
+    cycles = BillingCycles(day=day)
+    assert cycles.bounds(local(2027, 2, 15)) == (local(2027, 1, day), local(2027, 2, 28))
+    assert cycles.bounds(local(2027, 3, 15)) == (local(2027, 2, 28), local(2027, 3, day))
+    assert cycles.bounds(local(2027, 4, 15)) == (
+        local(2027, 3, day),
+        local(2027, 4, min(day, 30)),
+    )
+
+
 def test_electric_matches_october_bill():
     costs = electricity_costs(spread(2147), RATES)
     assert sum(c.value for c in costs) == pytest.approx(219.63, abs=0.01)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (datetime(2027, 3, 1, tzinfo=SITE_TZ), datetime(2027, 4, 1, tzinfo=SITE_TZ)),
+        (datetime(2026, 11, 1, tzinfo=SITE_TZ), datetime(2026, 12, 1, tzinfo=SITE_TZ)),
+    ],
+)
+def test_fixed_monthly_charge_is_exact_across_dst(start: datetime, end: datetime):
+    first = start.astimezone(timezone.utc)
+    count = int((end.astimezone(timezone.utc) - first) / timedelta(hours=1))
+    hours = [
+        HourlyUsage((first + timedelta(hours=i)).astimezone(SITE_TZ), 0.0)
+        for i in range(count)
+    ]
+    rates = Rates(electric_customer_charge=12.34, billing_day=1)
+    assert sum(c.value for c in electricity_costs(hours, rates)) == pytest.approx(12.34)
 
 
 def test_water_and_wastewater_match_october_bill():
@@ -246,6 +279,30 @@ def test_bill_cycles_follow_the_bills():
     assert cycles.bounds(local(2026, 9, 22, 23)) == BILLS[1]
     assert cycles.bounds(local(2026, 9, 23)) == BILLS[2]
     assert cycles.last_bill_end == local(2026, 10, 22)
+
+
+@pytest.mark.parametrize(
+    "periods",
+    [
+        [(local(2026, 8, 21), local(2026, 8, 21))],
+        [(local(2026, 8, 22), local(2026, 8, 21))],
+        [(datetime(2026, 8, 21), local(2026, 9, 23))],
+        [BILLS[0], (local(2026, 8, 20), local(2026, 9, 23))],
+        [BILLS[0], (local(2026, 8, 22), local(2026, 9, 23))],
+    ],
+)
+def test_bill_cycles_reject_invalid_reported_periods(periods):
+    with pytest.raises(LusError, match="billing period"):
+        BillingCycles(periods)
+
+
+@pytest.mark.parametrize("day", [29, 30, 31])
+def test_bill_cycle_projection_keeps_month_end_anchor(day: int):
+    cycles = BillingCycles([(local(2027, 1, day), local(2027, 2, 28))])
+    assert cycles.bounds(local(2027, 3, 15)) == (local(2027, 2, 28), local(2027, 3, day))
+
+    cycles = BillingCycles([(local(2027, 2, 28), local(2027, 3, day))])
+    assert cycles.bounds(local(2027, 2, 15)) == (local(2027, 1, day), local(2027, 2, 28))
 
 
 def test_bill_cycles_carry_on_monthly_beyond_the_bills():

@@ -87,8 +87,8 @@ async def test_setup_creates_bill_sensors_and_statistics(
         await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
 
-    device = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, ACCOUNT), entry.entry_id)
-    assert device is not None and device.name == "LUS"
+    device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, ACCOUNT)})
+    assert device is not None and entry.entry_id in device.config_entries and device.name == "LUS"
 
     ids = {
         e.unique_id: e.entity_id

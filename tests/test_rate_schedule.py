@@ -209,7 +209,7 @@ async def test_recalculation_overwrites_costs_from_the_date(harness):
     cost = harness.added[0][1]
     assert cost[0]["start"] == recalc
     assert len(cost) == 3 * 24
-    hourly_fixed = 13.00 / (31 * 24)  # 10/23-11/23 cycle
+    hourly_fixed = 13.00 / (31 * 24 + 1)  # 10/23-11/23 crosses the fall DST change
     assert cost[0]["state"] == pytest.approx(2.0 * 0.09624 + hourly_fixed)
     assert cost[0]["sum"] == pytest.approx(50.0 + cost[0]["state"])
 

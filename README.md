@@ -48,7 +48,9 @@ from your bill's rates and adds three more statistics:
 | `lus:<id>_water_cost` | Tiered water + wastewater volume (with the summer discount) + water, state and wastewater fixed charges |
 | `lus:<account>_total_cost` | Electricity + water costs + garbage, through the newest hour both meters have reported |
 
-- Monthly fixed charges are spread evenly over the hours of each billing cycle.
+- Monthly fixed charges are spread evenly over the real elapsed hours of each
+  billing cycle, so a cycle crossing a daylight-saving change still gets exactly
+  one fixed charge.
 - Water and wastewater follow LUS rate schedules W1 and S1. In April–November
   bills, water above the tier-1 limit is charged at the tier-2 rate, and
   wastewater is charged on the tier-1 limit or actual use, whichever is less
@@ -82,8 +84,9 @@ from your bill's rates and adds three more statistics:
   and LUS reads on a different day some months. Water tiers reset at the start
   of each water period. The open cycle is taken to end a month after the last
   bill; once the next bill shows its real end, that cycle's stored costs are
-  recalculated. A day set in the options instead makes every cycle start at
-  midnight on that day.
+  recalculated. Projected month-end dates clamp in shorter months without
+  permanently drifting earlier in later months. A day set in the options
+  instead makes every cycle start at midnight on that day.
 - Checked against the October 2026 bill: with that bill's tier-1 limit of
   20,470 gallons, the model reproduces its $475.39 in current charges to
   within a cent when usage is spread across the cycle.

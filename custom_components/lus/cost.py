@@ -5,15 +5,16 @@ Kept free of Home Assistant imports so it can be tested on its own.
 
 from __future__ import annotations
 
+import calendar
 from bisect import bisect_right
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, fields
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import math
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .api import HourlyUsage, next_hour
+from .api import HourlyUsage, next_hour, validate_bill_periods
 
 SITE_TZ = ZoneInfo("America/Chicago")
 
@@ -172,26 +173,35 @@ class BillingCycles:
         periods: Iterable[tuple[datetime, datetime]] = (),
         day: int = DEFAULT_CYCLE_DAY,
     ) -> None:
-        self._bounds = sorted({t.astimezone(SITE_TZ) for period in periods for t in period})
+        checked = validate_bill_periods(periods)
+        self._periods = [
+            (start.astimezone(SITE_TZ), end.astimezone(SITE_TZ))
+            for start, end in checked
+        ]
+        self._starts = [period[0] for period in self._periods]
         self._day = day
 
     @property
     def last_bill_end(self) -> datetime | None:
         """End of the newest bill period, if there are any."""
-        return self._bounds[-1] if self._bounds else None
+        return self._periods[-1][1] if self._periods else None
 
     def bounds(self, when: datetime) -> tuple[datetime, datetime]:
         """Return the start and end of the billing cycle containing `when`."""
-        known = self._bounds
-        if len(known) >= 2 and known[0] <= when < known[-1]:
-            i = bisect_right(known, when) - 1
-            return known[i], known[i + 1]
-        if known and when >= known[-1]:
-            start, end = _monthly_bounds(when, known[-1].day)
-            return max(start, known[-1]), end
+        known = self._periods
+        if known and known[0][0] <= when < known[-1][1]:
+            period = known[bisect_right(self._starts, when) - 1]
+            # Validation guarantees reported history has no gaps, so this is an
+            # actual portal period rather than a pair of unrelated endpoints.
+            return period
+        if known and when >= known[-1][1]:
+            anchor = _projection_day(known[-1][1], known[-1][0])
+            start, end = _monthly_bounds(when, anchor)
+            return max(start, known[-1][1]), end
         if known:
-            start, end = _monthly_bounds(when, known[0].day)
-            return start, min(end, known[0])
+            anchor = _projection_day(known[0][0], known[0][1])
+            start, end = _monthly_bounds(when, anchor)
+            return start, min(end, known[0][0])
         return _monthly_bounds(when, self._day)
 
 
@@ -215,7 +225,14 @@ def _monthly_bounds(when: datetime, billing_day: int) -> tuple[datetime, datetim
 
 
 def _cycle_start(year: int, month: int, billing_day: int) -> datetime:
-    return datetime(year, month, min(billing_day, 28), tzinfo=SITE_TZ)
+    last_day = calendar.monthrange(year, month)[1]
+    return datetime(year, month, min(billing_day, last_day), tzinfo=SITE_TZ)
+
+
+def _projection_day(boundary: datetime, adjacent: datetime) -> int:
+    """Recover a month-end anchor when a reported boundary was clamped."""
+    last_day = calendar.monthrange(boundary.year, boundary.month)[1]
+    return max(boundary.day, adjacent.day) if boundary.day == last_day else boundary.day
 
 
 def _add_month(year: int, month: int, delta: int) -> tuple[int, int]:
@@ -237,7 +254,8 @@ class _Cycles:
 
     def hours(self, hour: datetime) -> float:
         start, end = self.bounds(hour)
-        return (end - start) / timedelta(hours=1)
+        elapsed = end.astimezone(timezone.utc) - start.astimezone(timezone.utc)
+        return elapsed / timedelta(hours=1)
 
 
 def fill_gaps(hours: Iterable[HourlyUsage]) -> list[HourlyUsage]:

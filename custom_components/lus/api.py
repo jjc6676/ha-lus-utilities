@@ -262,12 +262,55 @@ def parse_reads(body: dict[str, Any]) -> list[Read]:
 def parse_bill_periods(body: dict[str, Any]) -> list[tuple[datetime, datetime]]:
     """Build billing periods from a bill-aggregated reads response."""
     periods = []
-    for item in body.get("reads") or []:
-        if item.get("startTime") and item.get("endTime"):
+    for index, item in enumerate(body.get("reads") or []):
+        start_text = item.get("startTime")
+        end_text = item.get("endTime")
+        if not start_text and not end_text:
+            # The undated aggregation can include non-period account-level items.
+            continue
+        if not start_text or not end_text:
+            raise LusError(f"billing period {index} has only one endpoint")
+        try:
             periods.append(
-                (datetime.fromisoformat(item["startTime"]), datetime.fromisoformat(item["endTime"]))
+                (datetime.fromisoformat(start_text), datetime.fromisoformat(end_text))
             )
-    return sorted(periods)
+        except (TypeError, ValueError) as err:
+            raise LusError(f"billing period {index} has an invalid date") from err
+    return validate_bill_periods(periods)
+
+
+def validate_bill_periods(
+    periods: Iterable[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """Return chronological, continuous, positive, timezone-aware bill periods."""
+    checked = []
+    for index, period in enumerate(periods):
+        try:
+            start, end = period
+        except (TypeError, ValueError) as err:
+            raise LusError(f"billing period {index} is not a (start, end) pair") from err
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise LusError(f"billing period {index} endpoints must be datetimes")
+        if (
+            start.tzinfo is None
+            or start.utcoffset() is None
+            or end.tzinfo is None
+            or end.utcoffset() is None
+        ):
+            raise LusError(f"billing period {index} has a naive datetime endpoint")
+        if end <= start:
+            raise LusError(f"billing period {index} has a non-positive duration")
+        checked.append((start, end))
+
+    checked.sort(key=lambda period: period[0])
+    for index, (previous, current) in enumerate(zip(checked, checked[1:]), start=1):
+        if current[0] < previous[1]:
+            raise LusError(f"billing period {index} overlaps the previous billing period")
+        if current[0] > previous[1]:
+            raise LusError(
+                f"billing period {index} is discontinuous from the previous billing period"
+            )
+    return checked
 
 
 def to_hourly(
