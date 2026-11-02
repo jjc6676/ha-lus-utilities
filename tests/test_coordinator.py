@@ -218,7 +218,7 @@ async def test_costs_wait_while_last_winters_reads_come_in(harness, monkeypatch)
     assert c._winters == {}
 
 
-async def test_an_incomplete_winter_is_used_but_read_again_next_update(harness):
+async def test_old_incomplete_winter_is_cached_after_settle(harness):
     # March's bill never gets 3/18-3/20.
     reads = without_march_18_to_20(
         hourly_reads(datetime(2025, 11, 23, tzinfo=SITE_TZ), datetime(2026, 3, 23, tzinfo=SITE_TZ), 30.0)
@@ -232,8 +232,64 @@ async def test_an_incomplete_winter_is_used_but_read_again_next_update(harness):
     c._winter_results = {}  # _async_update_data clears per-update attempts
     await c._async_import_meter(WATER, Rates(), (last_hour, 0.0))
 
-    assert winter_requests(c) == WINTER_REQUESTS * 2
+    assert winter_requests(c) == WINTER_REQUESTS
     assert c._winters == {}
+
+
+async def test_old_no_data_winter_is_cached_after_settle(harness):
+    c = harness.make([])
+
+    first = await c._async_account_winter_average(
+        [WATER], Rates(water_tier1_gallons=20000), date(2026, 10, 27)
+    )
+    c._winter_results = {}  # simulate the next coordinator update
+    again = await c._async_account_winter_average(
+        [WATER], Rates(water_tier1_gallons=20000), date(2026, 10, 27)
+    )
+
+    assert first == again == coord.WinterAverageData(2026, "1000000002", None)
+    assert winter_requests(c) == WINTER_REQUESTS
+    assert c._winters == {}
+
+
+async def test_within_settle_incomplete_winter_retries_and_can_complete(harness):
+    complete_reads = hourly_reads(
+        datetime(2025, 11, 23, tzinfo=SITE_TZ),
+        datetime(2026, 3, 23, tzinfo=SITE_TZ),
+        30.0,
+    )
+    c = harness.make(without_march_18_to_20(complete_reads))
+
+    first = await c._async_winter_result(WATER, 2026, 23, date(2026, 3, 26))
+    c.client.reads = complete_reads
+    c._winter_results = {}  # simulate the next coordinator update
+    again = await c._async_winter_result(WATER, 2026, 23, date(2026, 3, 26))
+
+    assert first[1] is False
+    assert again == (pytest.approx(30 * (720 + 744 + 744 + 671) / 4), True)
+    assert winter_requests(c) == WINTER_REQUESTS * 2
+
+
+async def test_manual_tier_limit_does_not_refetch_old_incomplete_winter(harness):
+    reads = without_march_18_to_20(
+        hourly_reads(
+            datetime(2025, 11, 23, tzinfo=SITE_TZ),
+            datetime(2026, 3, 23, tzinfo=SITE_TZ),
+            30.0,
+        )
+    )
+    c = harness.make(reads)
+
+    first = await c._async_account_winter_average(
+        [WATER], Rates(water_tier1_gallons=20000), date(2026, 10, 27)
+    )
+    c._winter_results = {}  # simulate the next coordinator update
+    again = await c._async_account_winter_average(
+        [WATER], Rates(water_tier1_gallons=20000), date(2026, 10, 27)
+    )
+
+    assert first == again == coord.WinterAverageData(2026, "1000000002", None)
+    assert winter_requests(c) == WINTER_REQUESTS
 
 
 async def test_account_winter_reuses_calculation_with_manual_limit(harness):

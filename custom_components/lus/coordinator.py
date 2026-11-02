@@ -146,6 +146,11 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         # All results attempted during this update, including incomplete ones.
         # This lets the sensor reuse a summer-tier lookup without a duplicate fetch.
         self._winter_results: dict[tuple[str, int, int], tuple[float | None, bool]] = {}
+        # Incomplete results are retried while the latest winter can still settle,
+        # then retained so historical gaps do not trigger four requests per update.
+        self._settled_winter_results: dict[
+            tuple[str, int, int], tuple[float | None, bool]
+        ] = {}
 
     async def _async_update_data(self) -> LusData | None:
         self._winter_results = {}
@@ -320,10 +325,15 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
     async def _async_winter_result(
         self, meter: Meter, winter: int, billing_day: int, today: date
     ) -> tuple[float | None, bool]:
-        """Read a winter once per update and retain completed results thereafter."""
+        """Read a winter once per update and retain results once settled."""
         key = (meter.uuid, billing_day, winter)
         if key in self._winters:
             return self._winters[key], True
+        settled_results = getattr(self, "_settled_winter_results", None)
+        if settled_results is None:
+            settled_results = self._settled_winter_results = {}
+        if key in settled_results:
+            return settled_results[key]
         results = getattr(self, "_winter_results", None)
         if results is None:
             results = self._winter_results = {}
@@ -339,6 +349,13 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
                 winter,
                 meter.utility_account_id,
                 "no data" if average is None else round(average),
+            )
+        elif today - winter_cycles(winter, billing_day)[-1][1].date() > WINTER_SETTLE:
+            settled_results[key] = result
+            _LOGGER.info(
+                "Winter %s reads for meter %s settled incomplete",
+                winter,
+                meter.utility_account_id,
             )
         return result
 
