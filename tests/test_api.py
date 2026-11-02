@@ -241,6 +241,8 @@ async def test_bill_periods_come_from_the_bill_aggregation_without_dates():
     [
         {"startTime": "2026-08-21T00:00:00-05:00"},
         {"endTime": "2026-09-23T00:00:00-05:00"},
+        {"startTime": "2026-08-21T00:00:00-05:00", "endTime": None},
+        {"startTime": None, "endTime": "2026-09-23T00:00:00-05:00"},
         {"startTime": "not-a-date", "endTime": "2026-09-23T00:00:00-05:00"},
         {"startTime": "2026-08-21T00:00:00", "endTime": "2026-09-23T00:00:00"},
     ],
@@ -250,6 +252,46 @@ def test_bill_periods_reject_partial_malformed_or_naive_dates(item):
 
     with pytest.raises(LusError, match="billing period"):
         parse_bill_periods({"reads": [item]})
+
+
+@pytest.mark.parametrize("item", [None, "dated read", 0, []])
+def test_bill_periods_reject_non_mapping_read_items(item):
+    from custom_components.lus.api import LusError, parse_bill_periods
+
+    with pytest.raises(LusError, match=r"billing period 0 must be a mapping"):
+        parse_bill_periods({"reads": [item]})
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"startTime": "", "endTime": ""},
+        {"startTime": 0, "endTime": 0},
+        {"startTime": False, "endTime": False},
+        {"startTime": 123, "endTime": "2026-09-23T00:00:00-05:00"},
+        {"startTime": "2026-08-21T00:00:00-05:00", "endTime": []},
+    ],
+)
+def test_bill_periods_reject_present_but_invalid_endpoints(item):
+    from custom_components.lus.api import LusError, parse_bill_periods
+
+    with pytest.raises(LusError, match=r"billing period 0 has an invalid endpoint"):
+        parse_bill_periods({"reads": [item]})
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {},
+        {"startTime": None},
+        {"endTime": None},
+        {"startTime": None, "endTime": None},
+    ],
+)
+def test_bill_periods_skip_records_with_no_dated_endpoints(item):
+    from custom_components.lus.api import parse_bill_periods
+
+    assert parse_bill_periods({"reads": [item]}) == []
 
 
 async def test_login_and_reads_send_expected_headers():

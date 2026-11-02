@@ -5,7 +5,7 @@ Kept free of Home Assistant imports so it can be run and tested on its own.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import json
@@ -263,13 +263,22 @@ def parse_bill_periods(body: dict[str, Any]) -> list[tuple[datetime, datetime]]:
     """Build billing periods from a bill-aggregated reads response."""
     periods = []
     for index, item in enumerate(body.get("reads") or []):
+        if not isinstance(item, Mapping):
+            raise LusError(f"billing period {index} must be a mapping")
         start_text = item.get("startTime")
         end_text = item.get("endTime")
-        if not start_text and not end_text:
+        if start_text is None and end_text is None:
             # The undated aggregation can include non-period account-level items.
             continue
-        if not start_text or not end_text:
+        if start_text is None or end_text is None:
             raise LusError(f"billing period {index} has only one endpoint")
+        if (
+            not isinstance(start_text, str)
+            or not start_text
+            or not isinstance(end_text, str)
+            or not end_text
+        ):
+            raise LusError(f"billing period {index} has an invalid endpoint")
         try:
             periods.append(
                 (datetime.fromisoformat(start_text), datetime.fromisoformat(end_text))
