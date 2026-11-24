@@ -6,6 +6,12 @@ into Home Assistant long-term statistics, for use in the Energy dashboard.
 The built-in Opower integration doesn't list LUS: LUS runs Opower's DSS portal,
 which has its own login and API path. This integration talks to it directly.
 
+**Quick start:** [Install](#install) it, then follow
+[Set up the Utility bill dashboard](#set-up-the-utility-bill-dashboard): a
+five-minute, click-by-click guide with screenshots that ends with one page
+showing your usage graphs, this bill's forecast and your spending. A
+[TL;DR](#tldr) with the paste-ready dashboard is at the end of that section.
+
 > **Disclaimer:** This is an unofficial, independent project. It is not
 > affiliated with, endorsed by, or supported by Lafayette Utilities System
 > (LUS), the Lafayette Utilities Authority, or Opower/Oracle. The LUS name
@@ -227,10 +233,194 @@ that figure instead.
 2. Restart Home Assistant.
 3. Settings → Devices & services → Add integration → **LUS (Lafayette Utilities System)**.
 4. Enter your portal username and password.
-5. Settings → Dashboards → Energy: add `LUS electricity …` under Electricity grid
-   consumption and `LUS water …` under Water consumption.
+5. Follow [Set up the Utility bill dashboard](#set-up-the-utility-bill-dashboard)
+   to add the meters to the Energy dashboard and get one page with the
+   graphs, the bill forecast and the spending sensors.
 
 Requires Home Assistant 2026.1 or newer.
+
+## Set up the Utility bill dashboard
+
+After [Install](#install), two things put everything on one page: the
+Energy dashboard needs to know about the LUS meters, and a **Utility bill**
+dashboard shows the Energy graphs with all the bill and spending sensors
+under them. It takes about five minutes and needs no files on the server.
+The screenshots come from a test install with made-up meters and usage.
+
+![The finished Utility bill dashboard](docs/images/utility-bill-dashboard.png)
+
+### Part A: connect the meters to the Energy dashboard
+
+Do this once. The Utility bill dashboard reads its graphs from here.
+
+1. Click **Energy** in the sidebar, then the **pencil** at the top right.
+   That opens the Energy configuration page (its address ends in
+   `/config/energy`, so you can also type that after your Home Assistant
+   address). If Energy has never been set up, Home Assistant may show a
+   setup wizard instead; its Electricity grid and Water steps ask the same
+   questions as below.
+2. Under **Electricity grid → Grid consumption**, click **Add consumption**.
+3. In **Consumed energy**, pick **`LUS electricity 1000000001`** (your meter
+   number instead of `1000000001`). The picker may show it as
+   `lus:1000000001_electricity_consumption`.
+4. Choose **Use an entity tracking the total costs**, then pick
+   **`LUS electricity cost 1000000001`**
+   (`lus:1000000001_electricity_cost`). Click **Save**.
+
+   <img src="docs/images/energy-electricity.png" alt="Configure grid consumption with the LUS electricity meter and its cost" width="700">
+
+5. Scroll down to **Water consumption** and click **Add water source**.
+6. In **Water usage**, pick **`LUS water 1000000002`**
+   (`lus:1000000002_water_consumption`).
+7. Choose **Use an entity tracking the total costs**, then pick
+   **`LUS water cost 1000000002`** (`lus:1000000002_water_cost`). Click
+   **Save**.
+
+   <img src="docs/images/energy-water.png" alt="Configure water consumption with the LUS water meter and its cost" width="700">
+
+Don't add the **wastewater** meter as a water source: its gallons are the
+same water, so every gallon would count twice. Its cost is already in the
+water cost.
+
+### Part B: add the Utility bill dashboard
+
+1. Go to **Settings → Dashboards** and click **+ Add dashboard** at the bottom
+   right.
+2. Pick **New dashboard from scratch**.
+
+   <img src="docs/images/dashboard-new.png" alt="The Add dashboard dialog with New dashboard from scratch" width="700">
+
+3. Type **`Utility bill`** as the **Title**, leave **Add to sidebar** on and
+   click **Create**.
+
+   <img src="docs/images/dashboard-title.png" alt="Add new dashboard with the title Utility bill" width="700">
+
+4. Click **Utility bill** in the sidebar. The new dashboard is empty.
+5. Click the **pencil** at the top right to edit it.
+6. Click the **⋮** menu at the top right and pick **Raw configuration
+   editor**.
+
+   <img src="docs/images/dashboard-raw-editor.png" alt="The three-dot menu with Raw configuration editor" width="700">
+
+7. Click inside the editor, press **Ctrl+A** (**⌘A** on a Mac) to select
+   everything, and paste the whole block from
+   [`dashboards/utility-bill.yaml`](dashboards/utility-bill.yaml). It's also
+   in the [TL;DR](#tldr) below; GitHub's copy button at the top right of the
+   block copies all of it.
+
+   <img src="docs/images/dashboard-paste.png" alt="The raw configuration editor with the dashboard pasted in" width="700">
+
+8. Click **Save**, then the **X** at the top left, then **Done**.
+
+That's it. The top half is the Energy dashboard (pick a day, week or month
+with the arrows), and the two cards underneath hold the bill and spending
+sensors described in [Estimated cost](#estimated-cost) and
+[Spending insights](#spending-insights).
+
+### If something looks wrong
+
+- **A card says "Entity not available"**: your sensors have different IDs.
+  Go to **Settings → Devices & services → LUS → (your device)** and click a
+  sensor, then the gear, to see its **Entity ID**. Some older installs use
+  `sensor.lus_utilities_…` instead of `sensor.lus_…`. Open the raw configuration editor again, and use
+  **Ctrl+F** to find `sensor.lus_` and replace it with your prefix.
+- **The graphs are empty for today**: the LUS portal is usually a day or two
+  behind. Press **‹** next to the date once or twice.
+- **Sources table or graphs are empty for every day**: Part A isn't done yet,
+  or the statistics haven't been imported. The first import can take a few
+  minutes after the integration is added.
+- **Save asks about comments**: you pasted something other than the block
+  below. The raw editor drops YAML comments, so the block has none.
+
+### TL;DR
+
+| Where | Click / type |
+|---|---|
+| Sidebar → **Energy** → **pencil** (top right) → **Electricity grid** | **Add consumption** → `LUS electricity <meter>` → **Use an entity tracking the total costs** → `LUS electricity cost <meter>` → **Save** |
+| Same page, **Water consumption** | **Add water source** → `LUS water <meter>` → **Use an entity tracking the total costs** → `LUS water cost <meter>` → **Save**. Skip wastewater. |
+| Settings → Dashboards | **+ Add dashboard** → **New dashboard from scratch** → Title `Utility bill` → **Create** |
+| Sidebar → **Utility bill** | **pencil** → **⋮** → **Raw configuration editor** → **Ctrl+A** → paste the block below → **Save** → **X** → **Done** |
+
+Paste this whole block (also in
+[`dashboards/utility-bill.yaml`](dashboards/utility-bill.yaml)):
+
+```yaml
+views:
+  - title: Utility bill
+    path: bill
+    icon: mdi:cash-multiple
+    type: sections
+    max_columns: 2
+    sections:
+      - type: grid
+        column_span: 2
+        cards:
+          - type: energy-date-selection
+            grid_options:
+              columns: full
+          - type: energy-distribution
+            title: Energy distribution
+            grid_options:
+              columns: full
+          - type: energy-sources-table
+            title: Sources
+            grid_options:
+              columns: full
+      - type: grid
+        cards:
+          - type: energy-usage-graph
+            title: Electricity usage
+            grid_options:
+              rows: 5
+      - type: grid
+        cards:
+          - type: energy-water-graph
+            title: Water consumption
+            grid_options:
+              rows: 5
+      - type: grid
+        cards:
+          - type: entities
+            title: This bill
+            grid_options:
+              rows: 8
+            entities:
+              - entity: sensor.lus_forecast_bill_this_period
+                name: Forecast this bill
+              - entity: sensor.lus_projected_bill_this_period
+                name: Projected this bill
+              - entity: sensor.lus_estimated_bill_this_period
+                name: So far this bill
+              - entity: sensor.lus_forecast_next_bill
+                name: Forecast next bill
+              - entity: sensor.lus_estimated_last_bill
+                name: Last bill (estimated)
+              - entity: sensor.lus_projected_change_from_last_bill
+                name: Change vs last bill
+      - type: grid
+        cards:
+          - type: entities
+            title: Spending
+            grid_options:
+              rows: 8
+            entities:
+              - entity: sensor.lus_cost_this_month
+                name: This month
+              - entity: sensor.lus_cost_this_year
+                name: This year
+              - entity: sensor.lus_cost_change_from_a_year_ago
+                name: Change vs a year ago
+              - entity: sensor.lus_cost_change_from_the_month_before
+                name: Change vs last month
+              - entity: sensor.lus_electricity_cost_per_kwh
+                name: Electricity per kWh
+              - entity: sensor.lus_water_and_wastewater_cost_per_gallon
+                name: Water and sewer per gallon
+              - entity: sensor.lus_unusual_usage_days
+                name: Unusual usage days
+              - entity: sensor.lus_winter_water_average
+                name: Winter water average
+```
 
 ## Check your login outside Home Assistant
 
