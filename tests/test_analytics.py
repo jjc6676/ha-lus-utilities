@@ -10,13 +10,13 @@ import math
 import pytest
 
 from custom_components.lus import analytics as an
+from custom_components.lus.analytics import elapsed_hours
 from custom_components.lus.api import FUEL_ELECTRICITY, FUEL_WATER, HourlyUsage
 from custom_components.lus.coordinator import total_costs
 from custom_components.lus.cost import (
     SITE_TZ,
     Rates,
     RateSchedule,
-    elapsed_hours,
     electricity_costs,
     water_costs,
 )

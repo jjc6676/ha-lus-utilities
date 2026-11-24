@@ -22,16 +22,16 @@ from typing import Any
 from .api import FUEL_ELECTRICITY, FUEL_WATER, HourlyUsage
 from .cost import (
     SITE_TZ,
+    BillingCycles,
     Rates,
     RateSchedule,
-    _as_schedule,
     _billed_month,
     _Cycles,
-    _cycle_start,
     _limit_winter,
     _summer_sewer_gallons,
+    as_schedule,
     cycle_bounds,
-    elapsed_hours,
+    fill_gaps,
     winter_average,
     winter_cycles,
     winters_needed,
@@ -79,6 +79,18 @@ MAD_TO_SIGMA = 1.4826
 CONTINUOUS_FLOW_HOURS = 24
 CONTINUOUS_FLOW_MIN_GALLONS = 0.5
 ANOMALY_REPORT_DAYS = 30
+
+
+def elapsed_hours(start: datetime, end: datetime) -> float:
+    """Real hours from `start` to `end`.
+
+    Subtracting two times in the same zone gives the wall-clock difference,
+    which is an hour out across a daylight-saving change, so both are taken to
+    UTC first.
+    """
+    return (end.astimezone(timezone.utc) - start.astimezone(timezone.utc)) / timedelta(
+        hours=1
+    )
 
 
 def pct_change(current: float, previous: float) -> float | None:
@@ -159,8 +171,8 @@ def electricity_charges(
     hours: Iterable[HourlyUsage], rates: Rates | RateSchedule
 ) -> list[Charges]:
     """The parts of `cost.electricity_costs`, hour by hour."""
-    schedule = _as_schedule(rates)
-    cycles = _Cycles(schedule.billing_day)
+    schedule = as_schedule(rates)
+    cycles = _Cycles(schedule.cycles)
     charges = []
     for h in hours:
         r = schedule.at(h.start)
@@ -184,8 +196,8 @@ def water_charges(
     As there, `hours` must be in order and should begin at a cycle start, and
     `winters` gives the tier-1 limit where the rates leave it at 0.
     """
-    schedule = _as_schedule(rates)
-    cycles = _Cycles(schedule.billing_day)
+    schedule = as_schedule(rates)
+    cycles = _Cycles(schedule.cycles)
     charges = []
     cycle_start = None
     used = 0.0
@@ -225,10 +237,10 @@ def winter_averages(
 ) -> dict[int, float]:
     """The December-March averages that set the tier-1 limit of the summer
     bills in `hours`, worked out from `hours` themselves where they cover them."""
-    billing_day = _as_schedule(rates).billing_day
+    cycles = as_schedule(rates).cycles
     averages = {}
     for winter in winters_needed(hours, rates):
-        average, _ = winter_average(hours, winter_cycles(winter, billing_day))
+        average, _ = winter_average(hours, winter_cycles(winter, cycles))
         if average is not None:
             averages[winter] = average
     return averages
@@ -435,9 +447,10 @@ def build_ledger(
 ) -> Ledger:
     """Cost out each meter's hours and line them up by hour.
 
-    `series` holds (fuel type, hourly usage) for each billed meter. A water
-    meter may add a third item, its known winter averages by year; winters not
-    given are worked out from the meter's own hours. Garbage is
+    `series` holds (fuel type, hourly usage) for each billed meter, optionally
+    followed by its known winter averages by year (winters not given are
+    worked out from a water meter's own hours) and then by the meter's own
+    rates, when its billing cycles differ from the account's. Garbage is
     charged to the hours every meter has reported, as the total cost statistic
     does. Over those hours the ledger's total equals that statistic; an hour
     only some meters have reported keeps their charges here, as their own cost
@@ -448,34 +461,47 @@ def build_ledger(
     charged: dict[datetime, list[Charges]] = {}
     fuels: list[str] = []
     winters: list[dict[int, float]] = []
-    for fuel, hours, *known in series:
+    # How many meters actually reported each hour, as against being filled in.
+    reported: dict[datetime, int] = {}
+    for fuel, hours, *extra in series:
+        known = extra[0] if extra else {}
+        # Each meter is billed on its own cycles when its bills' dates differ.
+        meter_rates = extra[1] if len(extra) > 1 else rates
         hours = sorted(hours, key=lambda h: h.start)
+        # Charges run through the hours a meter skipped, as the stored costs
+        # do; usage is only recorded for the hours it reported.
+        billed = fill_gaps(hours)
         if fuel == FUEL_ELECTRICITY:
-            slot, itemised = 0, electricity_charges(hours, rates)
+            slot, itemised = 0, electricity_charges(billed, meter_rates)
         elif fuel == FUEL_WATER:
-            meter_winters = {**winter_averages(hours, rates), **(known[0] if known else {})}
+            meter_winters = {**winter_averages(hours, meter_rates), **known}
             winters.append(meter_winters)
-            slot, itemised = 1, water_charges(hours, rates, meter_winters)
+            slot, itemised = 1, water_charges(billed, meter_rates, meter_winters)
         else:
             continue
         fuels.append(fuel)
-        for h, charges in zip(hours, itemised):
-            values = usage.setdefault(h.start, [None, None])
-            values[slot] = (values[slot] or 0.0) + h.value
+        measured = {h.start: h.value for h in hours}
+        for h, charges in zip(billed, itemised):
             charged.setdefault(h.start, []).append(charges)
+            if h.start in measured:
+                values = usage.setdefault(h.start, [None, None])
+                values[slot] = (values[slot] or 0.0) + h.value
+                reported[h.start] = reported.get(h.start, 0) + 1
 
-    schedule = _as_schedule(rates)
-    cycles = _Cycles(schedule.billing_day)
+    schedule = as_schedule(rates)
+    cycles = _Cycles(schedule.cycles)
     records = []
-    for start in sorted(usage):
+    for start in sorted(charged):
         parts = charged[start]
-        complete = len(parts) == len(fuels)
+        complete = reported.get(start, 0) == len(fuels)
         charges = Charges.sum(parts)
-        if complete:
+        # Garbage goes on every hour all meters are costed for, measured or
+        # filled in, as in the total cost statistic.
+        if len(parts) == len(fuels):
             charges += Charges(
                 garbage=schedule.at(start).garbage_charge / cycles.hours(start)
             )
-        kwh, gallons = usage[start]
+        kwh, gallons = usage.get(start, (None, None))
         records.append(
             HourRecord(
                 start.astimezone(timezone.utc),
@@ -544,7 +570,9 @@ def yearly(ledger: Ledger, now: datetime) -> list[PeriodSummary]:
     ]
 
 
-def billing_cycles(ledger: Ledger, billing_day: int, now: datetime) -> list[PeriodSummary]:
+def billing_cycles(
+    ledger: Ledger, billing_day: int | BillingCycles, now: datetime
+) -> list[PeriodSummary]:
     """One summary per billing cycle, labelled by the day its meter read closes it."""
     if ledger.first is None:
         return []
@@ -986,8 +1014,8 @@ def forecast_current_cycle(
     through = ledger.data_through
     if through is None:
         return None
-    schedule = _as_schedule(rates)
-    start, end = cycle_bounds(now, schedule.billing_day)
+    schedule = as_schedule(rates)
+    start, end = cycle_bounds(now, schedule.cycles)
     so_far = ledger.span(start, end, "")
     as_of = through.date()
     cycle_hours = elapsed_hours(start, end)
@@ -1033,14 +1061,19 @@ def forecast_current_cycle(
     )
 
 
-def _year_earlier(start: datetime, billing_day: int) -> tuple[datetime, datetime]:
-    """The billing cycle that started in the same month a year before."""
-    previous = _cycle_start(start.year - 1, start.month, billing_day)
-    return cycle_bounds(previous, billing_day)
+def _year_earlier(
+    start: datetime, end: datetime, billing_day: int | BillingCycles
+) -> tuple[datetime, datetime]:
+    """The billing cycle that covered the same time of year a year before."""
+    middle = _add_hours(start, elapsed_hours(start, end) / 2)
+    return cycle_bounds(_year_before(middle), billing_day)
 
 
 def yearly_growth(
-    ledger: Ledger, billing_day: int, before: datetime, cycles: int = GROWTH_CYCLES
+    ledger: Ledger,
+    billing_day: int | BillingCycles,
+    before: datetime,
+    cycles: int = GROWTH_CYCLES,
 ) -> tuple[float | None, float | None]:
     """Usage in the last complete cycles over the same cycles a year earlier.
 
@@ -1053,7 +1086,7 @@ def yearly_growth(
     for _ in range(cycles):
         start = cycle_bounds(end - timedelta(seconds=1), billing_day)[0]
         this_year = ledger.span(start, end, "")
-        last_year = ledger.span(*_year_earlier(start, billing_day), "")
+        last_year = ledger.span(*_year_earlier(start, end, billing_day), "")
         if this_year.complete and last_year.complete:
             recent[0] += this_year.kwh
             recent[1] += this_year.gallons
@@ -1080,12 +1113,12 @@ def forecast_next_cycle(
     through = ledger.data_through
     if through is None:
         return None
-    schedule = _as_schedule(rates)
-    billing_day = schedule.billing_day
+    schedule = as_schedule(rates)
+    billing_day = schedule.cycles
     current_start, current_end = cycle_bounds(now, billing_day)
     start, end = cycle_bounds(current_end, billing_day)
     days = elapsed_hours(start, end) / 24.0
-    last_year = ledger.span(*_year_earlier(start, billing_day), "")
+    last_year = ledger.span(*_year_earlier(start, end, billing_day), "")
     growth = yearly_growth(ledger, billing_day, current_start)
 
     seasonal = last_year.complete
@@ -1503,10 +1536,10 @@ def build_insights(
     ledger: Ledger, rates: Rates | RateSchedule, now: datetime
 ) -> Insights:
     """Run every analysis over the ledger as of `now`."""
-    schedule = _as_schedule(rates)
+    schedule = as_schedule(rates)
     months = monthly(ledger, now)
     years = yearly(ledger, now)
-    cycles = billing_cycles(ledger, schedule.billing_day, now)
+    cycles = billing_cycles(ledger, schedule.cycles, now)
     through = ledger.data_through
 
     month_over_month = year_over_year = None

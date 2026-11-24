@@ -65,7 +65,8 @@ Of that, **fixed** charges are `C_e + C_w + S + C_s + G` = $70.32 and
 
 ## 2. Cost hour by hour, and by calendar month or year
 
-A bill covers a billing cycle (the 23rd to the 23rd), not a calendar month. To
+A bill covers a billing cycle, not a calendar month. Cycles follow the dates on
+your own LUS bills (or a fixed day of the month if you set one). To
 add costs up over any span, each hour `h` is given its own cost:
 
 ```
@@ -79,6 +80,8 @@ garbage(h)     = G / H
 gallons from the start of the cycle, and `sewer(h)` is the amount by which the
 hour raises the cycle's wastewater gallons. `H` is the cycle's real length, so a fixed
 charge spread over all of a cycle's hours adds back up to exactly the charge.
+An hour the meter skipped still carries its share of the fixed charges, with no
+usage.
 A cycle that contains the November clock change has one hour more than its days
 × 24 and one that contains the March change has one less: 23 October to 23
 November 2026 is 31 × 24 + 1 = **745** hours.

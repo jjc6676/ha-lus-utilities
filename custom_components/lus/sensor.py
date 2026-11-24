@@ -33,7 +33,16 @@ class LusBillDescription(SensorEntityDescription):
     """A bill sensor: which cycle it reads and which figure."""
 
     cycle: Callable[[LusData], BillEstimate]
-    value: Callable[[BillEstimate], float | None]
+    value: Callable[[LusData], float | None]
+
+
+def projected_change(data: LusData) -> float | None:
+    """Return projected current bill minus the last complete bill."""
+    projected = data.current.projected
+    previous = data.previous
+    if projected is None or previous.data_through is None or not previous.complete:
+        return None
+    return projected - previous.cost
 
 
 SENSORS = (
@@ -41,19 +50,25 @@ SENSORS = (
         key="current_bill",
         translation_key="current_bill",
         cycle=lambda data: data.current,
-        value=lambda bill: bill.cost,
+        value=lambda data: data.current.cost,
     ),
     LusBillDescription(
         key="projected_bill",
         translation_key="projected_bill",
         cycle=lambda data: data.current,
-        value=lambda bill: bill.projected,
+        value=lambda data: data.current.projected,
+    ),
+    LusBillDescription(
+        key="projected_bill_change",
+        translation_key="projected_bill_change",
+        cycle=lambda data: data.current,
+        value=projected_change,
     ),
     LusBillDescription(
         key="last_bill",
         translation_key="last_bill",
         cycle=lambda data: data.previous,
-        value=lambda bill: bill.cost,
+        value=lambda data: data.previous.cost,
     ),
 )
 
@@ -245,15 +260,17 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data
-    account_id, currency = entry.unique_id, hass.config.currency
     async_add_entities(
         [
             *(
-                LusBillSensor(coordinator, account_id, currency, description)
+                LusBillSensor(coordinator, entry.unique_id, hass.config.currency, description)
                 for description in SENSORS
             ),
+            LusWinterAverageSensor(coordinator, entry.unique_id),
             *(
-                LusInsightSensor(coordinator, account_id, currency, description)
+                LusInsightSensor(
+                    coordinator, entry.unique_id, hass.config.currency, description
+                )
                 for description in INSIGHT_SENSORS
             ),
         ]
@@ -288,7 +305,12 @@ class LusBillSensor(CoordinatorEntity[LusCoordinator], SensorEntity):
         self.entity_description = description
         self._attr_unique_id = f"{account_id}_{description.key}"
         self._attr_native_unit_of_measurement = currency
-        self._attr_device_info = _device_info(account_id)
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, account_id)},
+            name="LUS",
+            manufacturer="Lafayette Utilities System",
+            entry_type=DeviceEntryType.SERVICE,
+        )
 
     def _bill(self) -> BillEstimate | None:
         data = self.coordinator.data
@@ -296,10 +318,10 @@ class LusBillSensor(CoordinatorEntity[LusCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> float | None:
-        bill = self._bill()
-        if bill is None:
+        data = self.coordinator.data
+        if data is None:
             return None
-        value = self.entity_description.value(bill)
+        value = self.entity_description.value(data)
         return round(value, 2) if value is not None else None
 
     @property
@@ -317,6 +339,44 @@ class LusBillSensor(CoordinatorEntity[LusCoordinator], SensorEntity):
                 else None
             ),
             "complete": bill.complete,
+        }
+
+
+class LusWinterAverageSensor(CoordinatorEntity[LusCoordinator], SensorEntity):
+    """Calculated average use for the latest completed December-March winter."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "winter_water_average"
+    _attr_native_unit_of_measurement = UnitOfVolume.GALLONS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+
+    def __init__(self, coordinator: LusCoordinator, account_id: str) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{account_id}_winter_water_average"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, account_id)},
+            name="LUS",
+            manufacturer="Lafayette Utilities System",
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        data = self.coordinator.data
+        if data is None or data.winter_average.gallons is None:
+            return None
+        return round(data.winter_average.gallons, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        data = self.coordinator.data
+        if data is None:
+            return None
+        winter = data.winter_average
+        return {
+            "winter_year": winter.year,
+            "water_meter_id": winter.water_meter_id,
         }
 
 

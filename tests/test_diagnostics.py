@@ -21,7 +21,9 @@ async def test_diagnostics_redact_credentials_and_account():
         options={"rate_schedule": [{"effective_from": None, "billing_day": 23}]},
         runtime_data=SimpleNamespace(
             last_update_success=True,
-            data=coord.LusData("5000000000", current, previous, insights),
+            data=coord.LusData(
+                "5000000000", current, previous, coord.WinterAverageData(2026, None, None), insights
+            ),
         ),
     )
     result = await async_get_config_entry_diagnostics(None, entry)

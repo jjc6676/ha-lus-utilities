@@ -7,7 +7,7 @@ import pytest
 
 from custom_components.lus import analytics as an, coordinator as coord
 from custom_components.lus.api import HourlyUsage, Meter
-from custom_components.lus.cost import SITE_TZ, Rates, bill_estimates
+from custom_components.lus.cost import SITE_TZ, Rates, as_schedule, bill_estimates
 from custom_components.lus.sensor import INSIGHT_SENSORS, SENSORS, LusInsightSensor
 
 UTC = timezone.utc
@@ -51,7 +51,7 @@ def make_sensor(key: str, insights: an.Insights | None, with_data: bool = True):
     data = None
     if with_data:
         current, previous = bill_estimates([], 23, NOW)
-        data = coord.LusData(ACCOUNT, current, previous, insights)
+        data = coord.LusData(ACCOUNT, current, previous, coord.WinterAverageData(2026, None, None), insights)
     return LusInsightSensor(SimpleNamespace(data=data), ACCOUNT, "USD", description)
 
 
@@ -240,7 +240,7 @@ async def test_insights_join_stored_history_to_the_fresh_hours(harness):
     }
 
     c = harness.make()
-    insights = await c._async_insights(fresh, RATES)
+    insights = await c._async_insights(fresh, {}, as_schedule(RATES))
 
     # Hours before the fetch came from statistics, in the meter's own units.
     stat_id, start, end, period, units, types = harness.queries[0]
@@ -254,7 +254,7 @@ async def test_insights_join_stored_history_to_the_fresh_hours(harness):
 
     # Later updates reuse the history instead of reading statistics again.
     harness.queries.clear()
-    again = await c._async_insights(fresh, RATES)
+    again = await c._async_insights(fresh, {}, as_schedule(RATES))
     assert harness.queries == []
     assert again.this_year.total == pytest.approx(insights.this_year.total)
 
@@ -276,7 +276,7 @@ async def test_history_is_trimmed_to_the_insight_window(harness):
     old = NOW - coord.INSIGHTS_HISTORY - timedelta(days=5)
     c = harness.make()
     c._history[ELECTRIC.uuid] = {old.astimezone(UTC): 9.0}
-    await c._async_insights({ELECTRIC: series(END - timedelta(days=2), END, lambda t: 2.0)}, RATES)
+    await c._async_insights({ELECTRIC: series(END - timedelta(days=2), END, lambda t: 2.0)}, {}, as_schedule(RATES))
     assert min(c._history[ELECTRIC.uuid]) >= NOW - coord.INSIGHTS_HISTORY
 
 
@@ -287,5 +287,5 @@ async def test_a_failed_analysis_does_not_fail_the_update(harness, monkeypatch, 
     monkeypatch.setattr(coord, "_build_insights", broken)
     c = harness.make()
     fresh = {ELECTRIC: series(END - timedelta(days=2), END, lambda t: 2.0)}
-    assert await c._async_insights(fresh, RATES) is None
+    assert await c._async_insights(fresh, {}, as_schedule(RATES)) is None
     assert "Could not work out LUS spending insights" in caplog.text

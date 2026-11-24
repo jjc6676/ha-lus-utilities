@@ -5,10 +5,11 @@ Kept free of Home Assistant imports so it can be run and tested on its own.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import json
+import math
 from typing import Any
 
 import aiohttp
@@ -166,8 +167,24 @@ class LusClient:
                 "includeEnhancedBilling": "false",
                 "includeMultiRegisterData": "false",
             },
+            strict_json=True,
         )
         return parse_reads(body)
+
+    async def async_get_bill_periods(self, meter: Meter) -> list[tuple[datetime, datetime]]:
+        """Return the meter's billing periods, oldest first, as (start, end).
+
+        Without dates, the bill aggregation returns every bill on the account.
+        """
+        body = await self._get(
+            f"DataBrowser-v1/cws/utilities/{CLIENT_CODE}/utilityAccounts/{meter.uuid}/reads",
+            params={
+                "aggregateType": "bill",
+                "includeEnhancedBilling": "false",
+                "includeMultiRegisterData": "false",
+            },
+        )
+        return parse_bill_periods(body)
 
     async def _get(
         self,
@@ -177,7 +194,8 @@ class LusClient:
         entities: bool = True,
         account_only: bool = False,
         retry: bool = True,
-    ) -> dict[str, Any]:
+        strict_json: bool = False,
+    ) -> Any:
         if self._token is None:
             raise LusAuthError("Not logged in")
         headers = {
@@ -198,7 +216,7 @@ class LusClient:
             headers=headers,
             timeout=REQUEST_TIMEOUT,
         ) as resp:
-            body = await _json(resp)
+            body = await _json(resp, strict=strict_json and resp.status == 200)
             status = resp.status
         if status == 401 and retry:
             # Sessions expire; log in again once and repeat the call.
@@ -209,6 +227,7 @@ class LusClient:
                 entities=entities,
                 account_only=account_only,
                 retry=False,
+                strict_json=strict_json,
             )
         if status == 401:
             raise LusAuthError("Session rejected right after logging in")
@@ -219,27 +238,31 @@ class LusClient:
             detail = str(_error(body).get("details") or "")[:200]
             raise LusError(f"GET {endpoint} returned HTTP {status}: {detail}")
         if body is None:
-            # Taking a maintenance page for "no reads" would leave a hole in
-            # the history that later imports never go back to fill.
+            # Taking a maintenance page for an empty answer would leave a hole
+            # in the history that later imports never go back to fill.
             raise LusError(f"GET {endpoint} returned something other than JSON")
         return body
 
 
-async def _json(resp: aiohttp.ClientResponse) -> dict[str, Any] | None:
-    """The response's JSON object, or None if it isn't one."""
+async def _json(resp: aiohttp.ClientResponse, *, strict: bool = False) -> Any:
+    """The response's JSON: any JSON value when `strict`, which raises if the
+    body isn't JSON at all; otherwise the JSON object, or None if it isn't one."""
     try:
         body = await resp.json(content_type=None)
     except (aiohttp.ContentTypeError, ValueError):
+        if strict:
+            raise LusError("Malformed reads response: body was not valid JSON") from None
         return None
-    return body if isinstance(body, dict) else None
+    return body if strict or isinstance(body, dict) else None
 
 
-def _error(body: dict[str, Any] | None) -> dict[str, Any]:
+def _error(body: Any) -> dict[str, Any]:
     """The error object of a response, whatever shape the portal gave it."""
-    error = (body or {}).get("error")
+    body = body if isinstance(body, dict) else {}
+    error = body.get("error")
     if isinstance(error, dict):
         return error
-    return {"details": error if error is not None else (body or {}).get("details")}
+    return {"details": error if error is not None else body.get("details")}
 
 
 def _field(body: dict[str, Any], key: str) -> Any:
@@ -273,65 +296,180 @@ def parse_meters(meta: dict[str, Any]) -> list[Meter]:
     return meters
 
 
-def parse_reads(body: dict[str, Any]) -> list[Read]:
+def parse_reads(body: Any) -> list[Read]:
     """Build reads from a DataBrowser reads response, skipping empty intervals."""
+    if not isinstance(body, dict):
+        raise LusError("Malformed reads response: expected a JSON object")
+    if "reads" not in body:
+        raise LusError("Malformed reads response: missing 'reads'")
+    items = body["reads"]
+    if not isinstance(items, list):
+        raise LusError("Malformed reads response: 'reads' must be a list")
+
     reads = []
-    try:
-        for item in body.get("reads") or []:
-            value = (item.get("consumption") or {}).get("value")
-            if value is None:
-                continue
-            reads.append(
-                Read(
-                    start=datetime.fromisoformat(item["startTime"]),
-                    end=datetime.fromisoformat(item["endTime"]),
-                    value=float(value),
-                )
+    for index, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            raise LusError(
+                f"Malformed reads response: read[{index}] must be a JSON object"
             )
-    except (AttributeError, KeyError, TypeError, ValueError) as err:
-        raise LusError("Portal reads were not in the expected form") from err
+
+        consumption = item.get("consumption")
+        if consumption is None:
+            continue
+        if not isinstance(consumption, Mapping):
+            raise LusError(
+                "Malformed reads response: "
+                f"read[{index}].consumption must be a JSON object or null"
+            )
+        value = consumption.get("value")
+        if value is None:
+            continue
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            numeric_value = math.nan
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(numeric_value)
+        ):
+            raise LusError(
+                "Malformed reads response: "
+                f"read[{index}].consumption.value must be a finite number"
+            )
+
+        reads.append(
+            Read(
+                start=_read_datetime(item, "startTime", index),
+                end=_read_datetime(item, "endTime", index),
+                value=numeric_value,
+            )
+        )
     return reads
+
+
+def _read_datetime(item: Mapping[str, Any], field: str, index: int) -> datetime:
+    """Return one required timezone-aware read timestamp."""
+    value = item.get(field)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            pass
+        else:
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                return parsed
+    raise LusError(
+        "Malformed reads response: "
+        f"read[{index}].{field} must be a timezone-aware ISO 8601 string"
+    )
+
+
+def parse_bill_periods(body: dict[str, Any]) -> list[tuple[datetime, datetime]]:
+    """Build billing periods from a bill-aggregated reads response."""
+    reads = body.get("reads")
+    if reads is None:
+        return []
+    if not isinstance(reads, Sequence) or isinstance(
+        reads, (str, bytes, bytearray)
+    ):
+        raise LusError("billing response 'reads' must be a sequence")
+    periods = []
+    for index, item in enumerate(reads):
+        if not isinstance(item, Mapping):
+            raise LusError(f"billing period {index} must be a mapping")
+        start_text = item.get("startTime")
+        end_text = item.get("endTime")
+        if start_text is None and end_text is None:
+            # The undated aggregation can include non-period account-level items.
+            continue
+        if start_text is None or end_text is None:
+            raise LusError(f"billing period {index} has only one endpoint")
+        if (
+            not isinstance(start_text, str)
+            or not start_text
+            or not isinstance(end_text, str)
+            or not end_text
+        ):
+            raise LusError(f"billing period {index} has an invalid endpoint")
+        try:
+            periods.append(
+                (datetime.fromisoformat(start_text), datetime.fromisoformat(end_text))
+            )
+        except (TypeError, ValueError) as err:
+            raise LusError(f"billing period {index} has an invalid date") from err
+    return validate_bill_periods(periods)
+
+
+def validate_bill_periods(
+    periods: Iterable[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """Return chronological, continuous, positive, timezone-aware bill periods."""
+    checked = []
+    for index, period in enumerate(periods):
+        try:
+            start, end = period
+        except (TypeError, ValueError) as err:
+            raise LusError(f"billing period {index} is not a (start, end) pair") from err
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise LusError(f"billing period {index} endpoints must be datetimes")
+        if (
+            start.tzinfo is None
+            or start.utcoffset() is None
+            or end.tzinfo is None
+            or end.utcoffset() is None
+        ):
+            raise LusError(f"billing period {index} has a naive datetime endpoint")
+        if end <= start:
+            raise LusError(f"billing period {index} has a non-positive duration")
+        checked.append((start, end))
+
+    checked.sort(key=lambda period: period[0])
+    for index, (previous, current) in enumerate(zip(checked, checked[1:]), start=1):
+        if current[0] < previous[1]:
+            raise LusError(f"billing period {index} overlaps the previous billing period")
+        if current[0] > previous[1]:
+            raise LusError(
+                f"billing period {index} is discontinuous from the previous billing period"
+            )
+    return checked
 
 
 def to_hourly(
     reads: Iterable[Read],
     reads_per_hour: int,
     settle: timedelta = timedelta(hours=48),
-    stored_through: datetime | None = None,
 ) -> list[HourlyUsage]:
     """Sum reads into clock hours.
 
-    Within `settle` of the newest read, stops at the first incomplete hour so
-    a partially reported hour is picked up whole on a later update instead of
-    being imported short. An hour with no reads at all counts as incomplete
-    too: hours are only ever appended after the last stored one, so stepping
-    over a hole would leave it empty for good once the portal fills it. Older
-    incomplete hours are taken as they are, and older empty ones skipped, so a
-    permanent gap in the meter data can't stall imports. Nor is there
-    anything to wait for at or before `stored_through`, the last hour already
-    imported: a hole behind it can no longer be filled.
+    Within `settle` of the newest read, stops at the first incomplete hour, or
+    at the first hour with no reads at all, so an hour still being reported is
+    picked up whole on a later update instead of being imported short or
+    skipped for good. Older incomplete hours are taken as they are and older
+    hours with no reads are left out, so a permanent gap in the meter data
+    can't stall imports.
     """
     reads = list(reads)
     if not reads:
         return []
     cutoff = max(r.end for r in reads) - settle
 
-    # Keyed by the hour as the portal wrote it, so its UTC offset is kept.
-    buckets: dict[datetime, tuple[datetime, list[Read]]] = {}
+    buckets: dict[datetime, list[Read]] = {}
     for read in reads:
         hour = read.start.replace(minute=0, second=0, microsecond=0)
-        buckets.setdefault(hour, (hour, []))[1].append(read)
+        buckets.setdefault(hour, []).append(read)
 
     hours: list[HourlyUsage] = []
-    # Walked in UTC so the repeated hour of a daylight-saving change is visited.
-    at = min(buckets).astimezone(timezone.utc)
-    last = max(buckets).astimezone(timezone.utc)
-    while at <= last:
-        hour, group = buckets.get(at, (at, []))
-        waiting = stored_through is None or at > stored_through
-        if len(group) < reads_per_hour and at >= cutoff and waiting:
+    for hour in sorted(buckets):
+        group = buckets[hour]
+        if hour >= cutoff and len(group) < reads_per_hour:
             break
-        if group:
-            hours.append(HourlyUsage(start=hour, value=sum(r.value for r in group)))
-        at += timedelta(hours=1)
+        if hours and next_hour(hours[-1].start) >= cutoff and hour > next_hour(hours[-1].start):
+            break
+        hours.append(HourlyUsage(start=hour, value=sum(r.value for r in group)))
     return hours
+
+
+def next_hour(hour: datetime) -> datetime:
+    """The start of the hour after `hour`, in real time across DST changes."""
+    return hour.astimezone(timezone.utc) + timedelta(hours=1)
