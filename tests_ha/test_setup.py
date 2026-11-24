@@ -97,17 +97,28 @@ async def test_setup_creates_bill_sensors_and_statistics(
     assert set(ids) == {
         f"{ACCOUNT}_current_bill",
         f"{ACCOUNT}_projected_bill",
+        f"{ACCOUNT}_projected_bill_change",
         f"{ACCOUNT}_last_bill",
         f"{ACCOUNT}_winter_water_average",
     }
 
     current = hass.states.get(ids[f"{ACCOUNT}_current_bill"])
+    projected = hass.states.get(ids[f"{ACCOUNT}_projected_bill"])
+    change_id = ids[f"{ACCOUNT}_projected_bill_change"]
+    change = hass.states.get(change_id)
     last = hass.states.get(ids[f"{ACCOUNT}_last_bill"])
     assert current.attributes["unit_of_measurement"] == "USD"
     assert current.attributes["friendly_name"] == "LUS Estimated bill this period"
     assert current.attributes["period_start"] == "2026-10-24"
     assert last.attributes["period_start"] == "2026-09-24"
     assert last.attributes["complete"] is True
+    assert change.attributes["friendly_name"] == "LUS Projected change from last bill"
+    assert change.attributes["device_class"] == "monetary"
+    assert change.attributes["unit_of_measurement"] == "USD"
+    # The display precision is kept on the registry entry, not in the state.
+    registered = er.async_get(hass).async_get(change_id)
+    assert registered.options["sensor"]["suggested_display_precision"] == 2
+    assert registered.device_id == device.id
 
     winter = hass.states.get(ids[f"{ACCOUNT}_winter_water_average"])
     assert winter.attributes["unit_of_measurement"] == "gal"
@@ -129,6 +140,9 @@ async def test_setup_creates_bill_sensors_and_statistics(
     )
     assert float(last.state) == pytest.approx(expected, abs=0.01)
     assert float(current.state) > 0
+    assert float(change.state) == pytest.approx(
+        float(projected.state) - float(last.state), abs=0.01
+    )
 
     await async_wait_recording_done(hass)
     stats = await recorder_mock.async_add_executor_job(

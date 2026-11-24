@@ -94,20 +94,23 @@ water source, or every gallon counts twice. To see the whole estimated bill,
 add a Statistics graph card for `LUS total cost …` with the "change" stat and a
 monthly period.
 
-**Account sensors:** an **LUS** device with four sensors, which the Overview
+**Account sensors:** an **LUS** device with five sensors, which the Overview
 dashboard shows automatically (or add them to any dashboard):
 
 | Sensor | Value |
 |---|---|
 | Estimated bill this period | Estimated charges since the last meter read, through the newest data |
 | Projected bill this period | That amount scaled to the whole billing period at the same hourly rate |
+| Projected change from last bill | Projected bill minus the previous completed bill; positive means the projection is higher, negative means lower, and zero means unchanged |
 | Estimated last bill | The most recent closed billing period; compare it with your bill |
 | Winter water average | Calculated average gallons per December–March bill for the latest completed winter |
 
-The three bill sensors have `period_start`, `period_end`, `data_through` and
+The four bill sensors have `period_start`, `period_end`, `data_through` and
 `complete` attributes. They include every charge the cost model covers, garbage
-included, and update with the statistics every 6 hours, so they trail by a day
-or two.
+included, and update with the statistics every 6 hours. The projected change is
+unknown until the current period has data and the previous period is complete.
+Because the LUS portal typically lags by a day or two, projections and their
+change trail current usage by the same amount.
 
 **Updating rates:** Settings → Devices & services → LUS → Configure.
 1. Pick the date the rates take effect. It defaults to the start of the most
