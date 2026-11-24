@@ -207,20 +207,33 @@ def cycle_charges(
     gallons: float | None,
     rates: Rates,
     billed_month: int,
+    electric_meters: int = 1,
+    water_meters: int = 1,
 ) -> Charges:
     """The bill for one whole billing cycle from its total usage.
 
     Pass None for a utility the account doesn't have. `billed_month` is the
     month the cycle ends in, which decides the summer wastewater discount.
+    Each meter carries its own fixed charges and, for water, its own tier-1
+    allowance; with more than one water meter the gallons are taken as split
+    evenly between them.
     """
     charges = Charges(garbage=rates.garbage_charge)
     if kwh is not None:
         charges += Charges(
             electric_energy=kwh * rates.electric_energy_rate,
             electric_fuel=kwh * rates.electric_fuel_adjustment_rate,
-            electric_fixed=rates.electric_customer_charge,
+            electric_fixed=rates.electric_customer_charge * electric_meters,
         )
-    if gallons is not None:
+    if gallons is not None and water_meters > 1:
+        each = cycle_charges(None, gallons / water_meters, rates, billed_month)
+        charges += Charges(
+            water_volume=each.water_volume * water_meters,
+            water_fixed=each.water_fixed * water_meters,
+            wastewater_volume=each.wastewater_volume * water_meters,
+            wastewater_fixed=each.wastewater_fixed * water_meters,
+        )
+    elif gallons is not None:
         tier1 = min(gallons, rates.water_tier1_gallons)
         tier2 = gallons - tier1
         sewer = tier1 if billed_month in rates.summer_months else gallons
@@ -314,9 +327,11 @@ class Ledger:
     def __init__(self, records: Iterable[HourRecord], fuels: Iterable[str]) -> None:
         self.records = sorted(records, key=lambda r: r.start)
         self._stamps = [r.start.timestamp() for r in self.records]
-        fuels = set(fuels)
-        self.has_electricity = FUEL_ELECTRICITY in fuels
-        self.has_water = FUEL_WATER in fuels
+        fuels = list(fuels)
+        self.electric_meters = fuels.count(FUEL_ELECTRICITY)
+        self.water_meters = fuels.count(FUEL_WATER)
+        self.has_electricity = self.electric_meters > 0
+        self.has_water = self.water_meters > 0
         # End of the newest hour every billed meter has reported.
         self.data_through: datetime | None = next(
             (_add_hours(r.start, 1) for r in reversed(self.records) if r.complete),
@@ -368,7 +383,10 @@ def build_ledger(
 
     `series` holds (fuel type, hourly usage) for each billed meter. Garbage is
     charged to the hours every meter has reported, as the total cost statistic
-    does, so the ledger's total matches it.
+    does. Over those hours the ledger's total equals that statistic; an hour
+    only some meters have reported keeps their charges here, as their own cost
+    statistics do, so while one meter lags a period's total can run ahead of
+    the total cost statistic.
     """
     usage: dict[datetime, list[float | None]] = {}
     charged: dict[datetime, list[Charges]] = {}
@@ -613,7 +631,8 @@ def to_date_comparisons(
         return None, None
 
     def fair(current: PeriodSummary, previous: PeriodSummary) -> Comparison | None:
-        if current.complete_hours == 0 or previous.coverage < COMPLETE_COVERAGE:
+        # A hole in either stretch would show up as a change in cost.
+        if min(current.coverage, previous.coverage) < COMPLETE_COVERAGE:
             return None
         return Comparison(current, previous)
 
@@ -621,12 +640,21 @@ def to_date_comparisons(
     month = None
     if through > month_start:
         prev_start = _local(*_previous_month(month_start.year, month_start.month))
-        prev_end = min(
-            _add_hours(prev_start, elapsed_hours(month_start, through)), month_start
+        # Both stretches are the same length. Late in a month that is longer
+        # than the one before, that is the whole of the shorter month.
+        hours = min(
+            elapsed_hours(month_start, through), elapsed_hours(prev_start, month_start)
         )
+        whole = hours == elapsed_hours(month_start, through)
         month = fair(
-            ledger.span(month_start, through, f"{month_start:%Y-%m} to date"),
-            ledger.span(prev_start, prev_end, f"{prev_start:%Y-%m} same days"),
+            ledger.span(
+                month_start,
+                _add_hours(month_start, hours),
+                f"{month_start:%Y-%m} " + ("to date" if whole else f"first {hours / 24:.0f} days"),
+            ),
+            ledger.span(
+                prev_start, _add_hours(prev_start, hours), f"{prev_start:%Y-%m} same days"
+            ),
         )
 
     year_start, _ = year_bounds(now)
@@ -858,6 +886,7 @@ def _forecast_from_usage(
     floor: tuple[float, float],
     days_projected: float,
     factors: dict[str, float],
+    meters: tuple[int, int] = (1, 1),
 ) -> Forecast:
     """Price expected usage and the usage one spread either side of it."""
     month = _billed_month(end)
@@ -867,7 +896,7 @@ def _forecast_from_usage(
             None if value is None else max(low, value + direction * width)
             for value, width, low in zip(expected, spread, floor)
         )
-        return cycle_charges(kwh, gallons, rates, month)
+        return cycle_charges(kwh, gallons, rates, month, *meters)
 
     return Forecast(
         cycle_start=start,
@@ -938,6 +967,7 @@ def forecast_current_cycle(
         (floor[0], floor[1]),
         missing_days,
         factors,
+        (ledger.electric_meters, ledger.water_meters),
     )
 
 
@@ -1030,6 +1060,7 @@ def forecast_next_cycle(
         (0.0, 0.0),
         days,
         applied,
+        (ledger.electric_meters, ledger.water_meters),
     )
 
 
@@ -1315,12 +1346,16 @@ def _continuous_flow(
         day = run[-1].local.date()
         if day in reported or day in found or (since is not None and day < since):
             return
-        usage = by_day[day].usage if day in by_day else 0.0
+        # Figures are for the run's last 24 hours, not its last calendar day,
+        # which is usually only part-way through when the data stops.
+        last_day = run[-CONTINUOUS_FLOW_HOURS:]
+        usage = sum(r.gallons for r in last_day)  # type: ignore[misc]
+        variable = sum(
+            r.charges.water_volume + r.charges.wastewater_volume for r in last_day
+        )
         # The steady trickle is what the leak itself wastes each day.
         wasted = lowest * 24.0
-        cost = (
-            by_day[day].variable_cost * min(1.0, wasted / usage) if usage > 0 else 0.0
-        )
+        cost = variable * wasted / usage if usage > 0 else 0.0
         found[day] = Anomaly(
             day=day,
             utility=WATER,

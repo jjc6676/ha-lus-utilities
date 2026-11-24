@@ -297,6 +297,7 @@ def to_hourly(
     reads: Iterable[Read],
     reads_per_hour: int,
     settle: timedelta = timedelta(hours=48),
+    stored_through: datetime | None = None,
 ) -> list[HourlyUsage]:
     """Sum reads into clock hours.
 
@@ -306,7 +307,9 @@ def to_hourly(
     too: hours are only ever appended after the last stored one, so stepping
     over a hole would leave it empty for good once the portal fills it. Older
     incomplete hours are taken as they are, and older empty ones skipped, so a
-    permanent gap in the meter data can't stall imports.
+    permanent gap in the meter data can't stall imports. Nor is there
+    anything to wait for at or before `stored_through`, the last hour already
+    imported: a hole behind it can no longer be filled.
     """
     reads = list(reads)
     if not reads:
@@ -325,7 +328,8 @@ def to_hourly(
     last = max(buckets).astimezone(timezone.utc)
     while at <= last:
         hour, group = buckets.get(at, (at, []))
-        if len(group) < reads_per_hour and at >= cutoff:
+        waiting = stored_through is None or at > stored_through
+        if len(group) < reads_per_hour and at >= cutoff and waiting:
             break
         if group:
             hours.append(HourlyUsage(start=hour, value=sum(r.value for r in group)))

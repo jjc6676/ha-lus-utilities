@@ -21,8 +21,10 @@ TO_REDACT = {CONF_USERNAME, CONF_PASSWORD, "account_id", "title", "unique_id"}
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: LusConfigEntry
 ) -> dict[str, Any]:
-    coordinator = entry.runtime_data
-    data = coordinator.data
+    # There is no coordinator while the entry isn't loaded, which is just
+    # when diagnostics are wanted: the portal is down or the sign-in failed.
+    coordinator = getattr(entry, "runtime_data", None)
+    data = coordinator.data if coordinator else None
     insights = data.insights if data else None
     return {
         "entry": async_redact_data(
@@ -35,7 +37,10 @@ async def async_get_config_entry_diagnostics(
             },
             TO_REDACT,
         ),
-        "last_update_success": coordinator.last_update_success,
+        "state": getattr(getattr(entry, "state", None), "value", None),
+        "last_update_success": (
+            coordinator.last_update_success if coordinator else None
+        ),
         "bills": (
             {
                 "current": asdict(data.current),

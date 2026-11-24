@@ -353,3 +353,30 @@ def test_to_hourly_steps_over_an_old_hour_with_no_reads():
     hours = to_hourly(reads, reads_per_hour=1)
     assert len(hours) == 24 * 5 - 1
     assert start + timedelta(hours=10) not in [h.start for h in hours]
+
+
+async def test_rejected_token_on_the_second_lookup_does_not_log_in_again():
+    session = FakeSession(
+        [
+            ("POST", LOGIN, 200, {"sessionToken": "tok-1"}),
+            ("GET", PRIMARY, 200, {"id": "1000000099"}),
+            ("GET", CURRENT, 401, {}),
+        ]
+    )
+    with pytest.raises(LusAuthError):
+        await LusClient(session, "user", "pw").async_login()
+    assert len(session.sent(LOGIN)) == 1
+
+
+def test_to_hourly_does_not_wait_behind_hours_already_stored():
+    # An earlier version stepped over the empty 10:00 and stored up to 23:00.
+    # Stopping at 10:00 now would stall everything after it for two days.
+    start = datetime(2026, 10, 26, tzinfo=CDT)
+    reads = hourly_reads(start, 30)
+    del reads[10]
+    hours = to_hourly(reads, reads_per_hour=1, stored_through=start + timedelta(hours=23))
+    assert len(hours) == 29
+    # A hole after the stored hours is still waited for.
+    del reads[25]
+    hours = to_hourly(reads, reads_per_hour=1, stored_through=start + timedelta(hours=23))
+    assert hours[-1].start == start + timedelta(hours=25)

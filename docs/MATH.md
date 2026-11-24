@@ -143,8 +143,11 @@ complete once it has ended and at least 95% of its hours have data from every
 billed meter. Because months differ in length, cost per day is compared too:
 
 ```
-per day = total / days in the period
+per day = total / (real hours in the period / 24)
 ```
+
+That is the number of days, except in a month with a clock change: November
+counts as 30.04 days and March as 30.96.
 
 **Example:** August 2026 at 2 kWh and 25 gal an hour, September at 2.5 kWh and
 30 gal an hour.
@@ -195,11 +198,13 @@ time `t`:
 ```
 month to date: [start of this month, t)   against   the same number of hours
                                                     from the start of last month
+               (late in a month longer than the one before, both are cut to the
+               length of the shorter month and labelled "first N days")
 year to date:  [1 January, t)             against   1 January to the same date
                                                     and time last year
 ```
 
-Each uses the percent change formula above, and is left empty when the earlier
+Each uses the percent change formula above, and is left empty when either
 stretch has less than 95% of its data.
 
 ## 5. Forecasting the bill
@@ -212,9 +217,13 @@ ended `a` days ago (yesterday is `a` = 1) has weight
 ```
 w = 0.5 ^ ((a - 1) / 7)                 half as much for each week older
 
-level L = Σ w × x / Σ w                 x = the day's usage
+level L = Σ w × x / Σ w                 x = the day's usage as a 24-hour rate
 sigma σ = sqrt( Σ w × (x - L)² / Σ w )
 ```
+
+A day needs at least 23 hours of data to count, and `x` is its usage × 24 /
+its hours with data, so a day with one missing read and the 23- and 25-hour
+clock-change days compare evenly. The drift below uses the same `x`.
 
 **Example:** 40 kWh fifteen days ago, 50 kWh eight days ago, 60 kWh yesterday.
 
@@ -249,7 +258,8 @@ low, high usage = expected ∓ spread             never below A
 ```
 
 Expected, low and high usage for electricity and water are then each priced with
-the whole-cycle bill of section 1. Pricing the cycle's usage as a whole, rather
+the whole-cycle bill of section 1 (with one set of fixed charges per meter if
+the account has more than one meter of a kind). Pricing the cycle's usage as a whole, rather
 than scaling up the cost so far, is what puts tier 2 water, the summer
 wastewater discount and the full fixed charges in the right place.
 
@@ -356,7 +366,7 @@ usage is the day's usage in that hour minus the baseline's median for that hour
 | Pattern in the extra usage | Reported cause |
 |---|---|
 | 60% or more in its 3 biggest hours, right after a day with missing data | `meter_catch_up`: delayed reads, not real usage |
-| Electricity: the quietest hour is at least double its usual level | `always_on_load`: strip heat, a heater, a pump, something stuck on |
+| Electricity: the quietest hour is at least double its usual level and at least 0.5 kWh above it, with under half of the extra in its 3 biggest hours | `always_on_load`: strip heat, a heater, a pump, something stuck on |
 | Electricity: 60% or more in its 3 biggest hours | `short_heavy_load`: EV charging, oven, dryer |
 | Electricity: half or more between noon and 9 pm, May to October | `cooling` |
 | Electricity: half or more overnight and morning, November to March | `heating` |
@@ -375,7 +385,8 @@ continuously when every hour for 24 hours in a row shows at least 0.5 gal:
 ```
 leak rate = the smallest hourly flow in the run
 wasted    = leak rate × 24            gallons per day
-cost      = the day's usage-based water charges × wasted / the day's usage
+cost      = usage-based water charges × wasted / usage,
+            both over the run's last 24 hours
 ```
 
 **Example:** 1 gal/h for three days is 24 gal a day, far too little to show as

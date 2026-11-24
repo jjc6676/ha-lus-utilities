@@ -234,7 +234,9 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         reads = []
         for start, end in _chunks(fetch_from, today, CHUNK_DAYS):
             reads.extend(await self.client.async_get_reads(meter, start, end))
-        hours = to_hourly(reads, meter.reads_per_hour)
+        hours = to_hourly(
+            reads, meter.reads_per_hour, stored_through=consumption_last[0]
+        )
 
         label, unit, unit_class = _FUELS[meter.fuel_type]
         self._add(

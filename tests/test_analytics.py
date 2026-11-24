@@ -687,3 +687,120 @@ def test_math_example_next_bill():
 def test_math_example_leak_cost():
     assert round(24 * (0.00209 + 0.00747), 2) == 0.23
     assert round(600 * (0.00209 + 0.00747), 2) == 5.74
+
+
+# --- Cases found in review ---------------------------------------------------
+
+
+def test_month_to_date_never_compares_unequal_lengths():
+    # Flat usage, data through 30 March: February has only 28 days.
+    start, through = local(2026, 12, 1), local(2027, 3, 31)
+    ledger = ledger_of(series(start, through, 2.0), series(start, through, base_gallons))
+    month, _ = an.to_date_comparisons(ledger, local(2027, 3, 31, 9))
+    assert month.current.hours_total == month.previous.hours_total == 28 * 24
+    assert month.current.label == "2027-03 first 28 days"
+    assert month.changes["kwh"].pct == pytest.approx(0)
+
+
+def test_to_date_comparison_is_withheld_when_this_month_has_a_hole():
+    start = local(2026, 8, 1)
+    hole = (local(2026, 10, 10), local(2026, 10, 20))
+    keep = lambda hours: [h for h in hours if not hole[0] <= h.start < hole[1]]  # noqa: E731
+    ledger = ledger_of(keep(series(start, STEADY_END, 2.0)), keep(series(start, STEADY_END, 25.0)))
+    month, _ = an.to_date_comparisons(ledger, NOW)
+    assert month is None
+
+
+def test_a_month_is_not_complete_before_it_ends():
+    # Through 30 October is 97% of the month, but the month isn't over.
+    start, through = local(2026, 7, 1), local(2026, 10, 31)
+    ledger = ledger_of(series(start, through, 2.0), series(start, through, 25.0))
+    insights = an.build_insights(ledger, RATES, local(2026, 10, 31, 9))
+    assert insights.months[-1].coverage > an.COMPLETE_COVERAGE
+    assert not insights.months[-1].complete
+    assert insights.month_over_month.current.label == "2026-09"
+
+
+def test_comparisons_skip_months_with_missing_data():
+    start = local(2025, 7, 1)
+
+    def without(first: datetime, last: datetime) -> an.Ledger:
+        keep = lambda hours: [h for h in hours if not first <= h.start < last]  # noqa: E731
+        return ledger_of(keep(series(start, STEADY_END, 2.0)), keep(series(start, STEADY_END, 25.0)))
+
+    # Ten days of September missing: the last complete month is August.
+    insights = an.build_insights(without(local(2026, 9, 5), local(2026, 9, 15)), RATES, NOW)
+    change = insights.month_over_month
+    assert (change.current.label, change.previous.label) == ("2026-08", "2026-07")
+    assert insights.year_over_year.current.label == "2026-08"
+    # August missing: September has nothing whole to be compared with.
+    insights = an.build_insights(without(local(2026, 8, 5), local(2026, 8, 15)), RATES, NOW)
+    assert insights.month_over_month is None
+    # The same month a year ago was only half there.
+    insights = an.build_insights(without(local(2025, 9, 1), local(2025, 9, 16)), RATES, NOW)
+    assert insights.year_over_year is None
+
+
+def test_growth_has_a_lower_limit_and_skips_incomplete_years():
+    start = local(2025, 7, 1)
+    electric = series(start, STEADY_END, usage_step(local(2026, 1, 1), 5.0, 1.0))
+    ledger = ledger_of(electric, series(start, STEADY_END, 25.0))
+    assert an.yearly_growth(ledger, 23, OCT_END)[0] == 0.5
+
+    # Two weeks missing a year ago would otherwise look like 10% growth.
+    hole = (local(2025, 9, 25), local(2025, 10, 9))
+    electric = [h for h in series(start, STEADY_END, 2.0) if not hole[0] <= h.start < hole[1]]
+    ledger = ledger_of(electric, series(start, STEADY_END, 25.0))
+    assert an.yearly_growth(ledger, 23, OCT_END)[0] == pytest.approx(1.0)
+
+
+def test_next_bill_has_a_range_and_differs_from_this_one():
+    start = local(2025, 7, 1)
+    noisy = lambda t: seasonal_kwh()(t) * (1.3 if t.day % 2 else 0.7)  # noqa: E731
+    ledger = ledger_of(series(start, STEADY_END, noisy), series(start, STEADY_END, 25.0))
+    this, following = an.forecast_current_cycle(ledger, RATES, NOW), an.forecast_next_cycle(ledger, RATES, NOW)
+    assert following.low < following.total < following.high
+    assert this.low < this.total < this.high
+    assert following.total != pytest.approx(this.total, abs=1.0)
+
+
+def test_forecast_charges_each_meter_its_own_fixed_charges():
+    start = local(2026, 8, 1)
+    ledger = an.build_ledger(
+        [
+            (FUEL_ELECTRICITY, series(start, STEADY_END, 1.0)),
+            (FUEL_ELECTRICITY, series(start, STEADY_END, 1.0)),
+            (FUEL_WATER, series(start, STEADY_END, 25.0)),
+        ],
+        RATES,
+    )
+    forecast = an.forecast_current_cycle(ledger, RATES, NOW)
+    assert forecast.charges.electric_fixed == pytest.approx(26.00)
+    two_water = an.cycle_charges(None, 30000, RATES, 1, water_meters=2)
+    # 15,000 gal on each meter stays in tier 1; one meter would not.
+    assert two_water.water_volume == pytest.approx(30000 * 0.00209)
+    assert two_water.water_fixed == pytest.approx(2 * 7.99)
+
+
+def test_leak_cost_does_not_depend_on_the_hour_the_data_stops():
+    leak_from = local(2026, 10, 27)
+    leaking = lambda t: base_gallons(t) + (1.0 if t >= leak_from else 0.0)  # noqa: E731
+    for end in (local(2026, 10, 30, 1), local(2026, 10, 30, 5), local(2026, 10, 30, 12)):
+        (anomaly,) = anomalies_for(water=leaking, end=end)
+        assert anomaly.day == date(2026, 10, 30)
+        assert anomaly.as_dict()["excess_cost"] == 0.23
+        assert anomaly.usage == pytest.approx(364.0) and anomaly.excess == pytest.approx(24.0)
+
+
+def test_season_decides_between_cooling_and_heating():
+    afternoon = lambda h: 2.5 if 12 <= h < 21 else 0.0  # noqa: E731
+    start, end, day = local(2025, 12, 1), local(2026, 1, 25), date(2026, 1, 20)
+    ledger = ledger_of(
+        series(start, end, with_extra(base_kwh, day, afternoon)), series(start, end, base_gallons)
+    )
+    (winter,) = an.detect_anomalies(ledger)
+    assert winter.cause != "cooling"
+
+
+def test_year_before_handles_leap_day():
+    assert an._year_before(date(2028, 2, 29)) == date(2027, 2, 28)

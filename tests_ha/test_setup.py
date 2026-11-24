@@ -144,3 +144,52 @@ async def test_setup_creates_bill_sensors_and_statistics(
         {"change"},
     )
     assert stats[f"{DOMAIN}:{ACCOUNT}_total_cost"]
+
+
+async def test_history_is_read_back_from_statistics_after_a_restart(
+    recorder_mock: Recorder, hass: HomeAssistant, entry: MockConfigEntry, freezer: FrozenDateTimeFactory
+) -> None:
+    freezer.move_to("2026-10-31T14:00:00+00:00")
+    hass.config.currency = "USD"
+    with patch("custom_components.lus.coordinator.LusClient", FakeClient):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await async_wait_recording_done(hass)
+        first = entry.runtime_data.data.insights
+
+        # Three weeks on, a fresh coordinator only refetches from the previous
+        # billing cycle; September has to come from the stored statistics.
+        freezer.move_to("2026-11-25T14:00:00+00:00")
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+    again = entry.runtime_data.data.insights
+
+    assert again.months[0].label == first.months[0].label == "2026-09"
+    assert again.months[0].kwh == pytest.approx(first.months[0].kwh)
+    assert again.months[0].gallons == pytest.approx(first.months[0].gallons)
+    assert again.months[0].kwh == pytest.approx(2.0 * 24 * 8)
+
+
+async def test_failed_sign_in_does_not_put_the_password_back_in_the_form(
+    recorder_mock: Recorder, hass: HomeAssistant
+) -> None:
+    from homeassistant.config_entries import SOURCE_USER
+
+    from custom_components.lus.api import LusAuthError
+
+    class Rejecting(FakeClient):
+        async def async_login(self) -> None:
+            raise LusAuthError("Login rejected")
+
+    with patch("custom_components.lus.config_flow.LusClient", Rejecting):
+        result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"username": "someone", "password": "hunter2"}
+        )
+
+    assert result["errors"] == {"base": "invalid_auth"}
+    suggested = {
+        str(key): (key.description or {}).get("suggested_value")
+        for key in result["data_schema"].schema
+    }
+    assert suggested == {"username": "someone", "password": None}

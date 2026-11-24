@@ -43,3 +43,14 @@ async def test_diagnostics_before_the_first_update():
     )
     result = await async_get_config_entry_diagnostics(None, entry)
     assert result["bills"] is None and result["insights"] is None
+
+
+async def test_diagnostics_when_the_entry_never_loaded():
+    # Portal down or sign-in rejected: there is no coordinator at all.
+    entry = SimpleNamespace(
+        title="LUS account 5000000000", unique_id="5000000000",
+        data={"username": "u", "password": "p"}, options={},
+    )
+    result = await async_get_config_entry_diagnostics(None, entry)
+    assert result["last_update_success"] is None and result["bills"] is None
+    assert "5000000000" not in json.dumps(result, default=str)
