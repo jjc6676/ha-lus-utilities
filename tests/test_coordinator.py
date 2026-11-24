@@ -97,7 +97,8 @@ async def test_later_import_continues_sum_after_last_hour(harness):
     assert cost_meta["statistic_id"] == COST_ID
     assert cost_meta["unit_of_measurement"] == "USD"
     assert len(cost) == 18
-    hourly_fixed = 13.00 / (31 * 24)  # 10/23-11/23 cycle
+    # The 10/23-11/23 cycle has 31 days plus the hour daylight saving gives back.
+    hourly_fixed = 13.00 / (31 * 24 + 1)
     assert cost[0]["state"] == pytest.approx(2.0 * 0.09624 + hourly_fixed)
     assert cost[0]["sum"] == pytest.approx(10.0 + cost[0]["state"])
 

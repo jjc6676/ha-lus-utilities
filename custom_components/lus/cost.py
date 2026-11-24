@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, fields
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -117,6 +117,19 @@ def _as_schedule(rates: Rates | RateSchedule) -> RateSchedule:
     return rates if isinstance(rates, RateSchedule) else RateSchedule([(None, rates)])
 
 
+def elapsed_hours(start: datetime, end: datetime) -> float:
+    """Real hours from `start` to `end`.
+
+    Subtracting two times in the same zone gives the wall-clock difference,
+    which is an hour out across a daylight-saving change, so both are taken to
+    UTC first. A cycle that spans the November change has one hour more than
+    its days x 24, and one that spans the March change has one less.
+    """
+    return (end.astimezone(timezone.utc) - start.astimezone(timezone.utc)) / timedelta(
+        hours=1
+    )
+
+
 def cycle_bounds(when: datetime, billing_day: int) -> tuple[datetime, datetime]:
     """Return the start and end of the billing cycle containing `when`."""
     local = when.astimezone(SITE_TZ)
@@ -149,8 +162,7 @@ class _Cycles:
         return self._current
 
     def hours(self, hour: datetime) -> float:
-        start, end = self.bounds(hour)
-        return (end - start) / timedelta(hours=1)
+        return elapsed_hours(*self.bounds(hour))
 
 
 def electricity_costs(
@@ -231,8 +243,8 @@ class BillEstimate:
         """The cost so far scaled to the whole cycle, at the same hourly rate."""
         if self.data_through is None:
             return None
-        covered = (self.data_through - self.cycle_start) / timedelta(hours=1)
-        whole = (self.cycle_end - self.cycle_start) / timedelta(hours=1)
+        covered = elapsed_hours(self.cycle_start, self.data_through)
+        whole = elapsed_hours(self.cycle_start, self.cycle_end)
         return self.cost * whole / covered if covered > 0 else None
 
 

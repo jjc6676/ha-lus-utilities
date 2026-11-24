@@ -1,6 +1,6 @@
 """Tests for the bill cost model."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -23,9 +23,12 @@ CYCLE_END = datetime(2026, 10, 23, tzinfo=SITE_TZ)
 
 
 def spread(total: float, start: datetime = CYCLE_START, end: datetime = CYCLE_END) -> list[HourlyUsage]:
-    """`total` spread evenly over every hour from start to end."""
-    count = int((end - start) / timedelta(hours=1))
-    return [HourlyUsage(start + timedelta(hours=i), total / count) for i in range(count)]
+    """`total` spread evenly over every real hour from start to end."""
+    # Stepped in UTC, as the portal's reads are, so a cycle that spans a
+    # daylight-saving change gets its extra or missing hour.
+    first = start.astimezone(timezone.utc)
+    count = int((end.astimezone(timezone.utc) - first) / timedelta(hours=1))
+    return [HourlyUsage(first + timedelta(hours=i), total / count) for i in range(count)]
 
 
 def test_cycle_bounds():

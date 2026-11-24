@@ -29,8 +29,9 @@ One statistic per meter with interval data on the account's primary LUS account:
 - After that it checks every 6 hours. The portal lags about 1 day for electric
   and 1–2 days for water, so the newest data is always a day or two old.
 - An hour is imported only once all of its reads are in, so partial hours are
-  never stored short. Hours with missing reads older than 48 hours are
-  imported as they are.
+  never stored short, and nothing after a missing hour is imported until it
+  arrives. Hours still short or missing after 48 hours are imported as they
+  are.
 - Wastewater is billed from the water meter, so its numbers usually match water.
 
 ## Estimated cost
@@ -44,7 +45,9 @@ from your bill's rates and adds three more statistics:
 | `lus:<id>_water_cost` | Tiered water + wastewater volume (with the summer discount) + water, state and wastewater fixed charges |
 | `lus:<account>_total_cost` | Electricity + water costs + garbage, for hours both meters have reported |
 
-- Monthly fixed charges are spread evenly over the hours of each billing cycle.
+- Monthly fixed charges are spread evenly over the real hours of each billing
+  cycle, so a cycle that spans a clock change (745 or 743 hours for 31 days)
+  still adds up to exactly the charge.
 - Water tiers reset at the start of each billing cycle (midnight on the meter
   read day, the 23rd by default).
 - In summer billing months, wastewater isn't charged on gallons above the
@@ -72,6 +75,75 @@ Each has `period_start`, `period_end`, `data_through` and `complete`
 attributes. They include every charge the cost model covers, garbage included,
 and update with the statistics every 6 hours, so they trail by a day or two.
 
+## Spending insights
+
+Nine more sensors on the **LUS** device answer what a bill doesn't. They are
+worked out from the usage history and your bill rates on every update, and
+[docs/MATH.md](docs/MATH.md) gives the formula and a worked example for each.
+
+| Sensor | Value | Attributes |
+|---|---|---|
+| Cost this month | Calendar month so far | `electricity`, `water`, `wastewater`, `garbage`, `fixed`, `variable`, `kwh`, `gallons`, plus `months` (the last 13) and `billing_periods` (the last 13 bills) |
+| Cost this year | Calendar year so far | The same breakdown, plus `years` |
+| Electricity cost per kWh | All-in $/kWh on the last complete bill, customer charge included | `usage_only_rate` (what one more kWh costs), `fixed_share` |
+| Water and wastewater cost per gallon | All-in $/gal on the last complete bill | `per_1000_gallons`, `water_only_rate`, `usage_only_rate` |
+| Cost change from the month before | % change, last complete month against the one before | Each utility, `kwh`, `gallons`, `per_day`, `drivers` (how much came from usage, rates and fixed charges), `month_to_date` |
+| Cost change from a year ago | % change, last complete month against the same month last year | The same, plus `year_to_date` |
+| Forecast bill this period | Expected bill for the current billing period | `low`, `high`, each utility, `kwh`, `gallons`, `factors` |
+| Forecast next bill | Expected bill for the period after | The same, with `method` `seasonal` or `trend` |
+| Unusual usage days | Days in the last 30 with a spike or a likely leak | `latest_explanation`, `latest_cause`, `excess_cost`, `anomalies` |
+
+- **Forecast or projected?** *Projected bill this period* scales the cost so
+  far to the whole period. *Forecast bill this period* fills the rest of the
+  period with your recent daily usage, adjusted for how the season moved over
+  the same days last year, and prices the whole period as one bill. That puts
+  tier 2 water and the summer wastewater discount where they will be billed,
+  so prefer it; the projected sensor is kept for existing dashboards.
+- **Comparisons need history.** Month over month needs two complete months;
+  year over year needs the same month a year earlier. Until then those sensors
+  are unknown. Three years of usage are kept for this.
+- **Unusual days** compares each day with the four weeks before it and names a
+  likely cause from when the extra was used: a few heavy hours, a raised
+  overnight level, a hot afternoon, an irrigation run. Water flowing in every
+  hour for 24 hours is reported as a likely leak however small. Causes are
+  read from the usage pattern only; there is no weather data behind them.
+- The first update after a restart reads the stored usage statistics once;
+  after that the history is kept in memory.
+
+A Markdown card for the month by utility:
+
+```yaml
+type: markdown
+content: >
+  {% set s = 'sensor.lus_cost_this_month' %}
+  | Utility | This month |
+
+  |---|---:|
+
+  | Electricity | ${{ state_attr(s, 'electricity') }} |
+
+  | Water | ${{ state_attr(s, 'water') }} |
+
+  | Wastewater | ${{ state_attr(s, 'wastewater') }} |
+
+  | Garbage | ${{ state_attr(s, 'garbage') }} |
+
+  | **Total** | **${{ states(s) }}** |
+```
+
+And an automation trigger for a new unusual day:
+
+```yaml
+trigger:
+  - platform: state
+    entity_id: sensor.lus_unusual_usage_days
+    attribute: latest_date
+action:
+  - service: notify.notify
+    data:
+      message: "{{ state_attr('sensor.lus_unusual_usage_days', 'latest_explanation') }}"
+```
+
 **Updating rates:** Settings → Devices & services → LUS → Configure.
 1. Pick the date the rates take effect. It defaults to the start of the most
    recently closed billing cycle, which is the period on the bill you just
@@ -86,7 +158,8 @@ usage isn't touched. Hours before the earliest dated set use the original,
 undated rates (the October 2026 bill unless you changed them), so backfilled
 history before your first bill entry is only approximate.
 
-**Not modeled:** taxes (currently $0 on the bill), late fees, payments and
+**Not modeled:** taxes (currently $0 on the bill, so effective rates include
+every fee but no tax), late fees, payments and
 credits, and any change in the tier-1 limit between cycles. The tier-1 limit
 of 20,470 gallons is taken from the October bill; if LUS prorates it by cycle
 length, months with a different number of days will be slightly off. Which
@@ -115,6 +188,23 @@ python3 -m venv .venv && .venv/bin/pip install aiohttp
 
 It prompts for the username and password (or reads `LUS_USERNAME` /
 `LUS_PASSWORD`), logs in, and prints a summary of the last 3 days per meter.
+Prefer the prompt: a password in an environment variable tends to end up in
+shell history or a `.env` file.
+
+## Your credentials
+
+- Home Assistant stores the portal username and password in the config entry
+  (`config/.storage/core.config_entries`), unencrypted, as it does for every
+  integration that signs in with a password. Anyone who can read that file or
+  a backup of it can read them, so protect backups and use a password that is
+  unique to the portal. The portal offers no token or app password to store
+  instead.
+- They are sent only to `dss-lus.opower.com`, over HTTPS, and are never written
+  to the log. The session token is kept in memory only.
+- **Download diagnostics** on the integration's page leaves out the username,
+  password and account number, so it is safe to attach to a bug report.
+- Statistic ids and names contain your utility account numbers. Crop them out
+  of screenshots you share.
 
 ## Development
 
@@ -122,6 +212,26 @@ It prompts for the username and password (or reads `LUS_USERNAME` /
 .venv/bin/pip install homeassistant pytest pytest-asyncio
 .venv/bin/python -m pytest
 ```
+
+`tests/` needs no running Home Assistant. `tests_ha/` loads the integration
+into a real one against a fake portal:
+
+```bash
+python3 -m venv .venv-ha && .venv-ha/bin/pip install -r requirements_test.txt
+.venv-ha/bin/python -m pytest tests_ha
+```
+
+| Module | What it does |
+|---|---|
+| `api.py` | Signs in to the portal, lists meters, fetches reads, sums them to hours |
+| `cost.py` | The bill model: rates over time, billing cycles, cost per hour |
+| `analytics.py` | Spending insights: breakdowns, effective rates, comparisons, forecasts, unusual days |
+| `coordinator.py` | Every 6 hours: fetch, write statistics, work out bills and insights |
+| `sensor.py` | The bill and insight sensors |
+| `config_flow.py` | Sign-in, re-authentication, and the bill rates form |
+| `diagnostics.py` | Redacted diagnostics download |
+
+`api.py`, `cost.py` and `analytics.py` import nothing from Home Assistant.
 
 ## How the portal API works
 
@@ -141,3 +251,6 @@ All calls go to `https://dss-lus.opower.com/webcenter/edge/apis/`.
      returns reads; both dates are inclusive.
 
 A 401 means the session expired; the client logs in again once and retries.
+A 400 or 403 at login counts as rejected credentials only when it comes with
+the portal's JSON error; without one it is treated as the portal being
+unavailable, so an outage page doesn't ask you to sign in again.

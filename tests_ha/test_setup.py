@@ -75,14 +75,19 @@ async def test_setup_creates_bill_sensors_and_statistics(
         await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
 
-    device = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, ACCOUNT), entry.entry_id)
+    device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, ACCOUNT)})
     assert device is not None and device.name == "LUS"
 
     ids = {
         e.unique_id: e.entity_id
         for e in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
     }
-    assert set(ids) == {f"{ACCOUNT}_current_bill", f"{ACCOUNT}_projected_bill", f"{ACCOUNT}_last_bill"}
+    bill_sensors = {"current_bill", "projected_bill", "last_bill"}
+    insight_sensors = {
+        "month_cost", "year_cost", "electricity_rate", "water_rate", "cost_change_month",
+        "cost_change_year", "forecast_bill", "forecast_next_bill", "usage_anomalies",
+    }
+    assert set(ids) == {f"{ACCOUNT}_{key}" for key in bill_sensors | insight_sensors}
 
     current = hass.states.get(ids[f"{ACCOUNT}_current_bill"])
     last = hass.states.get(ids[f"{ACCOUNT}_last_bill"])
@@ -103,6 +108,30 @@ async def test_setup_creates_bill_sensors_and_statistics(
     assert float(last.state) == pytest.approx(expected, abs=0.01)
     assert float(current.state) > 0
 
+    # Spending insights, from the same usage and rates
+    def state(key: str):
+        return hass.states.get(ids[f"{ACCOUNT}_{key}"])
+
+    month = state("month_cost")
+    assert month.attributes["friendly_name"] == "LUS Cost this month"
+    assert month.attributes["unit_of_measurement"] == "USD"
+    assert month.attributes["period"] == "2026-10"
+    assert float(month.state) == pytest.approx(
+        sum(month.attributes[u] for u in ("electricity", "water", "wastewater", "garbage")),
+        abs=0.02,
+    )
+    rate = state("electricity_rate")
+    assert rate.attributes["unit_of_measurement"] == "USD/kWh"
+    assert float(rate.state) == pytest.approx((kwh * 0.09624 + 13.00) / kwh, abs=1e-5)
+    assert state("water_rate").attributes["unit_of_measurement"] == "USD/gal"
+    forecast = state("forecast_bill")
+    assert forecast.attributes["period_end"] == "2026-11-23"
+    assert float(forecast.state) > float(current.state)
+    # A month of history is too little to compare with a year ago.
+    assert state("cost_change_year").state == "unknown"
+    # 30 gal every hour of every day is what a leak looks like.
+    assert state("usage_anomalies").attributes["latest_cause"] == "continuous_flow"
+
     await async_wait_recording_done(hass)
     stats = await recorder_mock.async_add_executor_job(
         statistics_during_period,
@@ -115,3 +144,52 @@ async def test_setup_creates_bill_sensors_and_statistics(
         {"change"},
     )
     assert stats[f"{DOMAIN}:{ACCOUNT}_total_cost"]
+
+
+async def test_history_is_read_back_from_statistics_after_a_restart(
+    recorder_mock: Recorder, hass: HomeAssistant, entry: MockConfigEntry, freezer: FrozenDateTimeFactory
+) -> None:
+    freezer.move_to("2026-10-31T14:00:00+00:00")
+    hass.config.currency = "USD"
+    with patch("custom_components.lus.coordinator.LusClient", FakeClient):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await async_wait_recording_done(hass)
+        first = entry.runtime_data.data.insights
+
+        # Three weeks on, a fresh coordinator only refetches from the previous
+        # billing cycle; September has to come from the stored statistics.
+        freezer.move_to("2026-11-25T14:00:00+00:00")
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+    again = entry.runtime_data.data.insights
+
+    assert again.months[0].label == first.months[0].label == "2026-09"
+    assert again.months[0].kwh == pytest.approx(first.months[0].kwh)
+    assert again.months[0].gallons == pytest.approx(first.months[0].gallons)
+    assert again.months[0].kwh == pytest.approx(2.0 * 24 * 8)
+
+
+async def test_failed_sign_in_does_not_put_the_password_back_in_the_form(
+    recorder_mock: Recorder, hass: HomeAssistant
+) -> None:
+    from homeassistant.config_entries import SOURCE_USER
+
+    from custom_components.lus.api import LusAuthError
+
+    class Rejecting(FakeClient):
+        async def async_login(self) -> None:
+            raise LusAuthError("Login rejected")
+
+    with patch("custom_components.lus.config_flow.LusClient", Rejecting):
+        result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"username": "someone", "password": "hunter2"}
+        )
+
+    assert result["errors"] == {"base": "invalid_auth"}
+    suggested = {
+        str(key): (key.description or {}).get("suggested_value")
+        for key in result["data_schema"].schema
+    }
+    assert suggested == {"username": "someone", "password": None}
