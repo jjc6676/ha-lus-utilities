@@ -5,7 +5,7 @@ Kept free of Home Assistant imports so it can be run and tested on its own.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import json
@@ -153,6 +153,21 @@ class LusClient:
         )
         return parse_reads(body)
 
+    async def async_get_bill_periods(self, meter: Meter) -> list[tuple[datetime, datetime]]:
+        """Return the meter's billing periods, oldest first, as (start, end).
+
+        Without dates, the bill aggregation returns every bill on the account.
+        """
+        body = await self._get(
+            f"DataBrowser-v1/cws/utilities/{CLIENT_CODE}/utilityAccounts/{meter.uuid}/reads",
+            params={
+                "aggregateType": "bill",
+                "includeEnhancedBilling": "false",
+                "includeMultiRegisterData": "false",
+            },
+        )
+        return parse_bill_periods(body)
+
     async def _get(
         self,
         path: str,
@@ -242,6 +257,76 @@ def parse_reads(body: dict[str, Any]) -> list[Read]:
             )
         )
     return reads
+
+
+def parse_bill_periods(body: dict[str, Any]) -> list[tuple[datetime, datetime]]:
+    """Build billing periods from a bill-aggregated reads response."""
+    reads = body.get("reads")
+    if reads is None:
+        return []
+    if not isinstance(reads, Sequence) or isinstance(
+        reads, (str, bytes, bytearray)
+    ):
+        raise LusError("billing response 'reads' must be a sequence")
+    periods = []
+    for index, item in enumerate(reads):
+        if not isinstance(item, Mapping):
+            raise LusError(f"billing period {index} must be a mapping")
+        start_text = item.get("startTime")
+        end_text = item.get("endTime")
+        if start_text is None and end_text is None:
+            # The undated aggregation can include non-period account-level items.
+            continue
+        if start_text is None or end_text is None:
+            raise LusError(f"billing period {index} has only one endpoint")
+        if (
+            not isinstance(start_text, str)
+            or not start_text
+            or not isinstance(end_text, str)
+            or not end_text
+        ):
+            raise LusError(f"billing period {index} has an invalid endpoint")
+        try:
+            periods.append(
+                (datetime.fromisoformat(start_text), datetime.fromisoformat(end_text))
+            )
+        except (TypeError, ValueError) as err:
+            raise LusError(f"billing period {index} has an invalid date") from err
+    return validate_bill_periods(periods)
+
+
+def validate_bill_periods(
+    periods: Iterable[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """Return chronological, continuous, positive, timezone-aware bill periods."""
+    checked = []
+    for index, period in enumerate(periods):
+        try:
+            start, end = period
+        except (TypeError, ValueError) as err:
+            raise LusError(f"billing period {index} is not a (start, end) pair") from err
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise LusError(f"billing period {index} endpoints must be datetimes")
+        if (
+            start.tzinfo is None
+            or start.utcoffset() is None
+            or end.tzinfo is None
+            or end.utcoffset() is None
+        ):
+            raise LusError(f"billing period {index} has a naive datetime endpoint")
+        if end <= start:
+            raise LusError(f"billing period {index} has a non-positive duration")
+        checked.append((start, end))
+
+    checked.sort(key=lambda period: period[0])
+    for index, (previous, current) in enumerate(zip(checked, checked[1:]), start=1):
+        if current[0] < previous[1]:
+            raise LusError(f"billing period {index} overlaps the previous billing period")
+        if current[0] > previous[1]:
+            raise LusError(
+                f"billing period {index} is discontinuous from the previous billing period"
+            )
+    return checked
 
 
 def to_hourly(

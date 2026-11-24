@@ -203,6 +203,115 @@ def login_responses(token: str = "tok-1") -> list:
     ]
 
 
+async def test_bill_periods_come_from_the_bill_aggregation_without_dates():
+    body = {
+        "reads": [
+            {
+                "startTime": "2026-08-21T00:00:00.000-05:00",
+                "endTime": "2026-09-23T00:00:00.000-05:00",
+                "consumption": {"value": 3100.0, "type": "ACTUAL"},
+            },
+            {
+                "startTime": "2026-07-22T00:00:00.000-05:00",
+                "endTime": "2026-08-21T00:00:00.000-05:00",
+                "consumption": {"value": 2900.0, "type": "ESTIMATED"},
+            },
+            {"consumption": {"value": 1.0}},  # no dates: skipped
+        ]
+    }
+    session = FakeSession(
+        login_responses() + [("GET", META, 200, METADATA), ("GET", READS, 200, body)]
+    )
+    client = LusClient(session, "user", "pw")
+    await client.async_login()
+    meters = await client.async_get_meters()
+
+    periods = await client.async_get_bill_periods(meters[0])
+    assert periods == [
+        (datetime(2026, 7, 22, tzinfo=CDT), datetime(2026, 8, 21, tzinfo=CDT)),
+        (datetime(2026, 8, 21, tzinfo=CDT), datetime(2026, 9, 23, tzinfo=CDT)),
+    ]
+    (sent,) = session.sent(READS)
+    assert sent["params"]["aggregateType"] == "bill"
+    assert "startDate" not in sent["params"] and "endDate" not in sent["params"]
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"startTime": "2026-08-21T00:00:00-05:00"},
+        {"endTime": "2026-09-23T00:00:00-05:00"},
+        {"startTime": "2026-08-21T00:00:00-05:00", "endTime": None},
+        {"startTime": None, "endTime": "2026-09-23T00:00:00-05:00"},
+        {"startTime": "not-a-date", "endTime": "2026-09-23T00:00:00-05:00"},
+        {"startTime": "2026-08-21T00:00:00", "endTime": "2026-09-23T00:00:00"},
+    ],
+)
+def test_bill_periods_reject_partial_malformed_or_naive_dates(item):
+    from custom_components.lus.api import LusError, parse_bill_periods
+
+    with pytest.raises(LusError, match="billing period"):
+        parse_bill_periods({"reads": [item]})
+
+
+@pytest.mark.parametrize("item", [None, "dated read", 0, []])
+def test_bill_periods_reject_non_mapping_read_items(item):
+    from custom_components.lus.api import LusError, parse_bill_periods
+
+    with pytest.raises(LusError, match=r"billing period 0 must be a mapping"):
+        parse_bill_periods({"reads": [item]})
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"startTime": "", "endTime": ""},
+        {"startTime": 0, "endTime": 0},
+        {"startTime": False, "endTime": False},
+        {"startTime": 123, "endTime": "2026-09-23T00:00:00-05:00"},
+        {"startTime": "2026-08-21T00:00:00-05:00", "endTime": []},
+    ],
+)
+def test_bill_periods_reject_present_but_invalid_endpoints(item):
+    from custom_components.lus.api import LusError, parse_bill_periods
+
+    with pytest.raises(LusError, match=r"billing period 0 has an invalid endpoint"):
+        parse_bill_periods({"reads": [item]})
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {},
+        {"startTime": None},
+        {"endTime": None},
+        {"startTime": None, "endTime": None},
+    ],
+)
+def test_bill_periods_skip_records_with_no_dated_endpoints(item):
+    from custom_components.lus.api import parse_bill_periods
+
+    assert parse_bill_periods({"reads": [item]}) == []
+
+
+@pytest.mark.parametrize("body", [{}, {"reads": None}])
+def test_bill_periods_allow_missing_reads(body):
+    from custom_components.lus.api import parse_bill_periods
+
+    assert parse_bill_periods(body) == []
+
+
+@pytest.mark.parametrize(
+    "reads",
+    [False, 0, "", "not a list", b"reads", {}, {"startTime": "ignored"}, object()],
+)
+def test_bill_periods_reject_invalid_reads_container(reads):
+    from custom_components.lus.api import LusError, parse_bill_periods
+
+    with pytest.raises(LusError, match=r"billing response 'reads' must be a sequence"):
+        parse_bill_periods({"reads": reads})
+
+
 async def test_login_and_reads_send_expected_headers():
     session = FakeSession(
         login_responses()
