@@ -30,7 +30,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import LusAuthError, LusClient, LusError
 from .const import CONF_RECALCULATE_FROM, DOMAIN
-from .cost import SITE_TZ, Rates, RateSchedule, cycle_bounds
+from .cost import SITE_TZ, BillingCycles, Rates, RateSchedule, cycle_bounds
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +46,10 @@ class LusConfigFlow(ConfigFlow, domain=DOMAIN):
     """Collect portal credentials and check them."""
 
     VERSION = 1
+    # 2: summer months follow LUS schedules W1 and S1. 3: the water tier-1 limit
+    # defaults to the meter's winter average. 4: costs cover hours a meter
+    # skipped. 5: billing cycles follow each meter's bills. See async_migrate_entry.
+    MINOR_VERSION = 5
 
     @staticmethod
     @callback
@@ -157,7 +161,11 @@ class LusOptionsFlow(OptionsFlowWithReload):
             return await self.async_step_rates()
 
         schedule = self._schedule()
-        latest_bill = _previous_cycle_start(schedule.billing_day)
+        # The coordinator knows the account's real bill dates once it has run.
+        coordinator = getattr(self.config_entry, "runtime_data", None)
+        latest_bill = _previous_cycle_start(
+            getattr(coordinator, "cycles", None) or schedule.cycles
+        )
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
@@ -202,7 +210,7 @@ class LusOptionsFlow(OptionsFlowWithReload):
         schema = {}
         for key, value in current.items():
             if key == "billing_day":
-                validator = vol.All(vol.Coerce(int), vol.Range(min=1, max=28))
+                validator = vol.All(vol.Coerce(int), vol.Range(min=0, max=28))
             elif key == "wastewater_summer_months":
                 validator = str
             else:
@@ -222,10 +230,10 @@ def _local_midnight(day: date) -> datetime:
     return datetime(day.year, day.month, day.day, tzinfo=SITE_TZ)
 
 
-def _previous_cycle_start(billing_day: int) -> date:
+def _previous_cycle_start(cycles: int | BillingCycles) -> date:
     """Start of the most recently closed billing cycle, the one the latest bill covers."""
-    current_start, _ = cycle_bounds(dt_util.now(SITE_TZ), billing_day)
-    previous_start, _ = cycle_bounds(current_start - timedelta(seconds=1), billing_day)
+    current_start, _ = cycle_bounds(dt_util.now(SITE_TZ), cycles)
+    previous_start, _ = cycle_bounds(current_start - timedelta(seconds=1), cycles)
     return previous_start.date()
 
 
