@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import logging
@@ -51,12 +52,16 @@ from .const import (
 from .cost import (
     SITE_TZ,
     BillEstimate,
+    BillingCycles,
     Rates,
     RateSchedule,
+    as_schedule,
     bill_estimates,
     cycle_bounds,
     electricity_costs,
+    fill_gaps,
     garbage_cost,
+    latest_completed_winter,
     water_costs,
     winter_average,
     winter_cycles,
@@ -89,6 +94,16 @@ class LusData:
     account_id: str
     current: BillEstimate
     previous: BillEstimate
+    winter_average: WinterAverageData
+
+
+@dataclass(frozen=True)
+class WinterAverageData:
+    """The account water meter's most recent completed winter average."""
+
+    year: int
+    water_meter_id: str | None
+    gallons: float | None
 
 # (start of the last stored hour, its running sum); (None, 0.0) if none stored.
 type LastStat = tuple[datetime | None, float]
@@ -129,29 +144,68 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
             entry.data[CONF_USERNAME],
             entry.data[CONF_PASSWORD],
         )
-        # (meter uuid, billing day, winter) -> average gallons per bill, or None
-        # if the meter has no reads for it; kept once the winter's data settles.
-        self._winters: dict[tuple[str, int, int], float | None] = {}
+        # (meter uuid, winter, its bills' cycles) -> average gallons per bill, or
+        # None if the meter has no reads for it; kept once every bill is covered.
+        self._winters: dict[tuple[str, int, tuple], float | None] = {}
+        # All results attempted during this update, including incomplete ones.
+        # This lets the sensor reuse a summer-tier lookup without a duplicate fetch.
+        self._winter_results: dict[tuple[str, int, tuple], tuple[float | None, bool]] = {}
+        # Incomplete results are retried while the latest winter can still settle,
+        # then retained so historical gaps do not trigger four requests per update.
+        self._settled_winter_results: dict[
+            tuple[str, int, tuple], tuple[float | None, bool]
+        ] = {}
+        # meter uuid -> end of the newest bill period seen in a completed update.
+        self._bill_ends: dict[str, datetime] = {}
+        # The account's billing cycles as of the last update, for the options flow.
+        self.cycles: BillingCycles | None = None
 
     async def _async_update_data(self) -> LusData | None:
+        self._winter_results = {}
         rates = RateSchedule.from_options(self.config_entry.options)
         # After rates change, costs from this point on are recomputed and
         # overwrite what's stored; earlier hours are left as they are.
-        recalculate_from = self._recalculate_from()
+        requested = self._recalculate_from()
+        recalculate_from = requested
         try:
             await self.client.async_login()
             meters = [
                 m for m in await self.client.async_get_meters() if m.fuel_type in _FUELS
             ]
+            # Each billed meter's cycles follow its own bills; the bill sensors
+            # follow the electric meter's.
+            billed = [m for m in meters if m.fuel_type in _COST_FUNCTIONS]
+            meter_rates: dict[str, RateSchedule] = {}
+            bill_ends: dict[str, datetime] = {}
+            for meter in billed:
+                meter_rates[meter.uuid], end, redo = await self._async_meter_rates(
+                    meter, rates
+                )
+                if end is not None:
+                    bill_ends[meter.uuid] = end
+                if redo is not None:
+                    recalculate_from = min(recalculate_from or redo, redo)
+            account = next((m for m in billed if m.fuel_type == FUEL_ELECTRICITY), None)
+            account = account or (billed[0] if billed else None)
+            account_rates = meter_rates[account.uuid] if account else rates
+
             total_id = total_cost_statistic_id(self.client.account_id)
             total_last = await self._async_last(total_id, recalculate_from)
             costs = []
             for meter in meters:
                 meter_costs = await self._async_import_meter(
-                    meter, rates, total_last, recalculate_from
+                    meter,
+                    meter_rates.get(meter.uuid, rates),
+                    total_last,
+                    recalculate_from,
+                    account_rates.cycles,
                 )
                 if meter_costs is not None:
                     costs.append(meter_costs)
+            today = dt_util.now(SITE_TZ).date()
+            winter_data = await self._async_account_winter_average(
+                meters, rates, today, meter_rates
+            )
         except LusAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
         except (LusError, aiohttp.ClientError, TimeoutError) as err:
@@ -159,7 +213,7 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
 
         data = None
         if costs:
-            totals = total_costs(costs, rates)
+            totals = total_costs(costs, account_rates)
             self._add(
                 total_id,
                 total_last,
@@ -167,11 +221,13 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
                 self._cost_metadata(total_id, f"LUS total cost {self.client.account_id}"),
             )
             current, previous = bill_estimates(
-                totals, rates.billing_day, dt_util.now(SITE_TZ)
+                totals, account_rates.cycles, dt_util.now(SITE_TZ)
             )
-            data = LusData(self.client.account_id, current, previous)
-        if recalculate_from is not None:
-            _LOGGER.info("Recalculated costs from %s", recalculate_from)
+            data = LusData(self.client.account_id, current, previous, winter_data)
+        self.cycles = account_rates.cycles
+        self._bill_ends.update(bill_ends)
+        if requested is not None:
+            _LOGGER.info("Recalculated costs from %s", requested)
             options = {
                 k: v
                 for k, v in self.config_entry.options.items()
@@ -179,6 +235,26 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
             }
             self.hass.config_entries.async_update_entry(self.config_entry, options=options)
         return data
+
+    async def _async_meter_rates(
+        self, meter: Meter, rates: RateSchedule
+    ) -> tuple[RateSchedule, datetime | None, datetime | None]:
+        """The rates with the meter's own bill periods as its cycles, the end of
+        its newest bill, and where to recalculate costs from because of it.
+
+        A cycle still open is costed with a guessed end, a month after the last
+        bill. Once a newer bill closes it, or on the first look since starting,
+        that cycle is costed again from its start with the bill's real dates.
+        """
+        if rates.billing_day:
+            # A day set in the options wins over the portal's dates.
+            return rates, None, None
+        cycles = BillingCycles(await self.client.async_get_bill_periods(meter))
+        end = cycles.last_bill_end
+        if end is None or self._bill_ends.get(meter.uuid) == end:
+            return rates.with_bill_cycles(cycles), end, None
+        closed_start, _ = cycles.bounds(end - timedelta(seconds=1))
+        return rates.with_bill_cycles(cycles), end, closed_start
 
     def _recalculate_from(self) -> datetime | None:
         value = self.config_entry.options.get(CONF_RECALCULATE_FROM)
@@ -193,6 +269,7 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         rates: Rates | RateSchedule,
         total_last: LastStat,
         recalculate_from: datetime | None = None,
+        account_cycles: int | BillingCycles | None = None,
     ) -> list[HourlyUsage] | None:
         """Import consumption and, for billed meters, cost. Returns the cost hours."""
         consumption_id = statistic_id(meter)
@@ -200,17 +277,22 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         cost_id = cost_statistic_id(meter) if cost_fn else None
 
         consumption_last = await self._async_last(consumption_id)
+        cycles = as_schedule(rates).cycles
         today = dt_util.now(SITE_TZ).date()
         resume = [self._resume_date(consumption_last, meter, today, None)]
         if cost_id:
             cost_last = await self._async_last(cost_id, recalculate_from)
             # Cost depends on usage earlier in the billing cycle, so re-read
             # from the start of the cycle being resumed.
-            resume.append(self._resume_date(cost_last, meter, today, rates.billing_day))
+            resume.append(self._resume_date(cost_last, meter, today, cycles))
             # The bill sensors need the previous cycle's total cost too.
             resume.append(
                 self._resume_date(
-                    total_last, meter, today, rates.billing_day, previous_cycle=True
+                    total_last,
+                    meter,
+                    today,
+                    cycles if account_cycles is None else account_cycles,
+                    previous_cycle=True,
                 )
             )
         fetch_from = min(resume)
@@ -238,14 +320,17 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         if not cost_id:
             return None
 
+        cost_hours = fill_gaps(hours)
         if meter.fuel_type == FUEL_WATER:
-            winters, hold_from = await self._async_winter_averages(meter, hours, rates, today)
-            costs = water_costs(hours, rates, winters)
+            winters, hold_from = await self._async_winter_averages(
+                meter, cost_hours, rates, today
+            )
+            costs = water_costs(cost_hours, rates, winters)
             if hold_from is not None:
                 # Store no cost that a winter still coming in could change.
                 costs = [c for c in costs if c.start < hold_from]
         else:
-            costs = cost_fn(hours, rates)
+            costs = cost_fn(cost_hours, rates)
         self._add(
             cost_id,
             cost_last,
@@ -264,43 +349,91 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         """December-March averages for the summer bills in `hours` that take
         their tier-1 limit from the meter, and the first hour whose cost has to
         wait for a winter's reads to come in (None if none does)."""
-        billing_day = rates.billing_day
+        cycles = as_schedule(rates).cycles
         averages = {}
         hold_from = None
         for winter, first_hour in winters_needed(hours, rates).items():
-            key = (meter.uuid, billing_day, winter)
-            if key in self._winters:
-                average = self._winters[key]
-            else:
-                average, complete = await self._async_read_winter(
-                    meter, winter, billing_day, today
-                )
-                winter_end = winter_cycles(winter, billing_day)[-1][1]
-                if complete:
-                    # Anything less is read again on the next update.
-                    self._winters[key] = average
-                    _LOGGER.info(
-                        "Winter %s average for meter %s: %s gallons per bill",
-                        winter,
-                        meter.utility_account_id,
-                        "no data" if average is None else round(average),
-                    )
-                elif today - winter_end.date() <= WINTER_SETTLE:
-                    # The last winter bill's reads can lag a few days.
-                    hold_from = first_hour if hold_from is None else min(hold_from, first_hour)
-                    continue
+            bills = tuple(winter_cycles(winter, cycles))
+            average, complete = await self._async_winter_result(meter, winter, bills, today)
+            if not complete and today - bills[-1][1].date() <= WINTER_SETTLE:
+                # The last winter bill's reads can lag a few days.
+                hold_from = first_hour if hold_from is None else min(hold_from, first_hour)
+                continue
             if average is not None:
                 averages[winter] = average
         return averages, hold_from
 
-    async def _async_read_winter(
-        self, meter: Meter, winter: int, billing_day: int, today: date
+    async def _async_account_winter_average(
+        self,
+        meters: list[Meter],
+        rates: Rates | RateSchedule,
+        today: date,
+        meter_rates: Mapping[str, RateSchedule] | None = None,
+    ) -> WinterAverageData:
+        """Return the latest completed winter for the account's water meter,
+        over that meter's own winter bills."""
+        winter = latest_completed_winter(today)
+        meter = next((m for m in meters if m.fuel_type == FUEL_WATER), None)
+        if meter is None:
+            return WinterAverageData(winter, None, None)
+        cycles = as_schedule((meter_rates or {}).get(meter.uuid, rates)).cycles
+        bills = tuple(winter_cycles(winter, cycles))
+        average, complete = await self._async_winter_result(meter, winter, bills, today)
+        return WinterAverageData(
+            winter,
+            meter.utility_account_id,
+            average if complete else None,
+        )
+
+    async def _async_winter_result(
+        self,
+        meter: Meter,
+        winter: int,
+        bills: tuple[tuple[datetime, datetime], ...],
+        today: date,
     ) -> tuple[float | None, bool]:
-        """The winter's average from the portal, and whether the reads cover
-        every winter bill metered from the start of its cycle."""
+        """Read a winter once per update and retain results once settled."""
+        key = (meter.uuid, winter, bills)
+        if key in self._winters:
+            return self._winters[key], True
+        settled_results = getattr(self, "_settled_winter_results", None)
+        if settled_results is None:
+            settled_results = self._settled_winter_results = {}
+        if key in settled_results:
+            return settled_results[key]
+        results = getattr(self, "_winter_results", None)
+        if results is None:
+            results = self._winter_results = {}
+        if key in results:
+            return results[key]
+        result = await self._async_read_winter(meter, bills, today)
+        results[key] = result
+        average, complete = result
+        if complete:
+            self._winters[key] = average
+            _LOGGER.info(
+                "Winter %s average for meter %s: %s gallons per bill",
+                winter,
+                meter.utility_account_id,
+                "no data" if average is None else round(average),
+            )
+        elif today - bills[-1][1].date() > WINTER_SETTLE:
+            settled_results[key] = result
+            _LOGGER.info(
+                "Winter %s reads for meter %s settled incomplete",
+                winter,
+                meter.utility_account_id,
+            )
+        return result
+
+    async def _async_read_winter(
+        self, meter: Meter, bills: tuple[tuple[datetime, datetime], ...], today: date
+    ) -> tuple[float | None, bool]:
+        """The average over the winter `bills` from the portal, and whether the
+        reads cover every one metered from the start of its cycle."""
         cycles = [
             (start, end)
-            for start, end in winter_cycles(winter, billing_day)
+            for start, end in bills
             if meter.first_read is None or start.date() >= meter.first_read
         ]
         if not cycles:
@@ -344,22 +477,22 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         last: LastStat,
         meter: Meter,
         today: date,
-        billing_day: int | None,
+        cycles: int | BillingCycles | None,
         previous_cycle: bool = False,
     ) -> date:
         """First day to fetch so everything after `last` can be computed.
 
-        With a billing day, that's the start of the cycle `last` is in, or of
+        With billing cycles, that's the start of the cycle `last` is in, or of
         the cycle before it when `previous_cycle` is set.
         """
         last_start, _ = last
         if last_start is None:
             return meter.first_read or (today - DEFAULT_BACKFILL)
-        if billing_day is None:
+        if cycles is None:
             return last_start.astimezone(SITE_TZ).date()
-        start = cycle_bounds(last_start, billing_day)[0]
+        start = cycle_bounds(last_start, cycles)[0]
         if previous_cycle:
-            start = cycle_bounds(start - timedelta(seconds=1), billing_day)[0]
+            start = cycle_bounds(start - timedelta(seconds=1), cycles)[0]
         return start.date()
 
     def _cost_metadata(self, stat_id: str, name: str) -> StatisticMetaData:
@@ -403,7 +536,8 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
 def total_costs(
     costs: list[list[HourlyUsage]], rates: Rates | RateSchedule
 ) -> list[HourlyUsage]:
-    """Sum per-meter costs plus garbage, for hours every meter has reported."""
+    """Sum per-meter costs plus garbage, through the newest hour every meter has
+    reported (each meter's costs cover the hours it skipped; see `fill_gaps`)."""
     by_meter = [{h.start: h.value for h in meter_costs} for meter_costs in costs]
     common = set(by_meter[0]).intersection(*by_meter[1:])
     return [

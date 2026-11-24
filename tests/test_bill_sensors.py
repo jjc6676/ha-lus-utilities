@@ -8,7 +8,12 @@ import pytest
 from custom_components.lus import coordinator as coord
 from custom_components.lus.api import HourlyUsage, Meter
 from custom_components.lus.cost import SITE_TZ, BillEstimate, Rates, bill_estimates
-from custom_components.lus.sensor import SENSORS, LusBillSensor, projected_change
+from custom_components.lus.sensor import (
+    SENSORS,
+    LusBillSensor,
+    LusWinterAverageSensor,
+    projected_change,
+)
 
 CDT = timezone(timedelta(hours=-5))
 
@@ -29,6 +34,9 @@ HOURS = hourly(local(2026, 9, 23), local(2026, 10, 23), 0.5) + hourly(
 NOW = local(2026, 10, 31, 9)
 
 
+NO_WINTER = coord.WinterAverageData(2026, None, None)
+
+
 def change_data(projected: float | None, previous: float = 100.0, *, complete: bool = True):
     """Build bill data for projected-change unit tests without portal or HA setup."""
     current_start, current_end = local(2026, 10, 23), local(2026, 11, 23)
@@ -36,7 +44,9 @@ def change_data(projected: float | None, previous: float = 100.0, *, complete: b
     current = BillEstimate(
         current_start,
         current_end,
-        0.0 if projected is None else projected / 31,
+        # One day's share of the cycle, which has 745 hours: 31 days plus the
+        # hour daylight saving gives back.
+        0.0 if projected is None else projected * 24 / 745,
         None if projected is None else current_start + timedelta(days=1),
     )
     previous_bill = BillEstimate(
@@ -45,7 +55,7 @@ def change_data(projected: float | None, previous: float = 100.0, *, complete: b
         previous,
         current_start if complete else current_start - timedelta(hours=1),
     )
-    return coord.LusData("5000000000", current, previous_bill)
+    return coord.LusData("5000000000", current, previous_bill, NO_WINTER)
 
 
 def test_projected_change_higher():
@@ -64,7 +74,7 @@ def test_projected_change_unavailable_without_projection_or_previous_data():
     assert projected_change(change_data(None)) is None
     data = change_data(125.0)
     previous = BillEstimate(data.previous.cycle_start, data.previous.cycle_end, 0.0, None)
-    assert projected_change(coord.LusData(data.account_id, data.current, previous)) is None
+    assert projected_change(coord.LusData(data.account_id, data.current, previous, NO_WINTER)) is None
 
 
 def test_projected_change_unavailable_with_incomplete_previous_cycle():
@@ -86,8 +96,27 @@ def test_current_and_previous_cycles():
 
 def test_projection_scales_to_the_whole_cycle():
     current, _ = bill_estimates(HOURS, 23, NOW)
-    # $1/h over the 31-day 10/23-11/23 cycle
-    assert current.projected == pytest.approx(31 * 24 * 1.0)
+    # $1 per elapsed hour over the fall-DST 10/23-11/23 cycle.
+    assert current.projected == pytest.approx(31 * 24 + 1)
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "through", "elapsed_hours"),
+    [
+        (local(2026, 2, 23), local(2026, 3, 25), local(2026, 3, 1), 144),
+        (local(2026, 10, 23), local(2026, 11, 22), local(2026, 10, 30), 168),
+    ],
+)
+def test_projection_preserves_fixed_charge_across_dst(
+    start, end, through, elapsed_hours
+):
+    whole_hours = (end.timestamp() - start.timestamp()) / 3600
+    fixed_charge = whole_hours
+    accumulated = elapsed_hours * fixed_charge / whole_hours
+
+    estimate = BillEstimate(start, end, accumulated, through)
+
+    assert estimate.projected == pytest.approx(fixed_charge)
 
 
 def test_cycle_without_data():
@@ -105,7 +134,12 @@ def make_sensor(key, data):
 
 def test_sensors_report_rounded_dollars_and_period():
     current, previous = bill_estimates(HOURS, 23, NOW)
-    data = coord.LusData("5000000000", current, previous)
+    data = coord.LusData(
+        "5000000000",
+        current,
+        previous,
+        coord.WinterAverageData(2026, "1000000002", 20470.456),
+    )
 
     this_period = make_sensor("current_bill", data)
     assert this_period.native_value == 168.0
@@ -117,14 +151,48 @@ def test_sensors_report_rounded_dollars_and_period():
         "data_through": "2026-10-29T23:59:59-05:00",
         "complete": False,
     }
-    assert make_sensor("projected_bill", data).native_value == 744.0
+    # The 10/23-11/23 cycle has 745 hours: 31 days plus the hour daylight saving gives back.
+    assert make_sensor("projected_bill", data).native_value == 745.0
     change = make_sensor("projected_bill_change", data)
-    assert change.native_value == 384.0
+    assert change.native_value == 385.0
     assert change.unique_id == "5000000000_projected_bill_change"
     assert make_sensor("projected_bill_change", change_data(125.556)).native_value == 25.56
     last = make_sensor("last_bill", data)
     assert last.native_value == 360.0
     assert last.extra_state_attributes["complete"] is True
+
+
+def test_winter_average_sensor_reports_gallons_and_source():
+    current, previous = bill_estimates(HOURS, 23, NOW)
+    data = coord.LusData(
+        "5000000000",
+        current,
+        previous,
+        coord.WinterAverageData(2026, "1000000002", 20470.456),
+    )
+    sensor = LusWinterAverageSensor(SimpleNamespace(data=data), "5000000000")
+
+    assert sensor.native_value == 20470.46
+    assert sensor.native_unit_of_measurement == "gal"
+    assert sensor.unique_id == "5000000000_winter_water_average"
+    assert sensor.extra_state_attributes == {
+        "winter_year": 2026,
+        "water_meter_id": "1000000002",
+    }
+
+
+def test_winter_average_sensor_is_unknown_without_usable_complete_reads():
+    current, previous = bill_estimates(HOURS, 23, NOW)
+    data = coord.LusData(
+        "5000000000", current, previous, coord.WinterAverageData(2026, None, None)
+    )
+    sensor = LusWinterAverageSensor(SimpleNamespace(data=data), "5000000000")
+
+    assert sensor.native_value is None
+    assert sensor.extra_state_attributes == {
+        "winter_year": 2026,
+        "water_meter_id": None,
+    }
 
 
 def test_sensors_are_unknown_before_first_data():
