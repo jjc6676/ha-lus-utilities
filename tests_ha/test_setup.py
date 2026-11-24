@@ -75,14 +75,19 @@ async def test_setup_creates_bill_sensors_and_statistics(
         await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
 
-    device = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, ACCOUNT), entry.entry_id)
+    device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, ACCOUNT)})
     assert device is not None and device.name == "LUS"
 
     ids = {
         e.unique_id: e.entity_id
         for e in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
     }
-    assert set(ids) == {f"{ACCOUNT}_current_bill", f"{ACCOUNT}_projected_bill", f"{ACCOUNT}_last_bill"}
+    bill_sensors = {"current_bill", "projected_bill", "last_bill"}
+    insight_sensors = {
+        "month_cost", "year_cost", "electricity_rate", "water_rate", "cost_change_month",
+        "cost_change_year", "forecast_bill", "forecast_next_bill", "usage_anomalies",
+    }
+    assert set(ids) == {f"{ACCOUNT}_{key}" for key in bill_sensors | insight_sensors}
 
     current = hass.states.get(ids[f"{ACCOUNT}_current_bill"])
     last = hass.states.get(ids[f"{ACCOUNT}_last_bill"])
@@ -102,6 +107,30 @@ async def test_setup_creates_bill_sensors_and_statistics(
     )
     assert float(last.state) == pytest.approx(expected, abs=0.01)
     assert float(current.state) > 0
+
+    # Spending insights, from the same usage and rates
+    def state(key: str):
+        return hass.states.get(ids[f"{ACCOUNT}_{key}"])
+
+    month = state("month_cost")
+    assert month.attributes["friendly_name"] == "LUS Cost this month"
+    assert month.attributes["unit_of_measurement"] == "USD"
+    assert month.attributes["period"] == "2026-10"
+    assert float(month.state) == pytest.approx(
+        sum(month.attributes[u] for u in ("electricity", "water", "wastewater", "garbage")),
+        abs=0.02,
+    )
+    rate = state("electricity_rate")
+    assert rate.attributes["unit_of_measurement"] == "USD/kWh"
+    assert float(rate.state) == pytest.approx((kwh * 0.09624 + 13.00) / kwh, abs=1e-5)
+    assert state("water_rate").attributes["unit_of_measurement"] == "USD/gal"
+    forecast = state("forecast_bill")
+    assert forecast.attributes["period_end"] == "2026-11-23"
+    assert float(forecast.state) > float(current.state)
+    # A month of history is too little to compare with a year ago.
+    assert state("cost_change_year").state == "unknown"
+    # 30 gal every hour of every day is what a leak looks like.
+    assert state("usage_anomalies").attributes["latest_cause"] == "continuous_flow"
 
     await async_wait_recording_done(hass)
     stats = await recorder_mock.async_add_executor_job(

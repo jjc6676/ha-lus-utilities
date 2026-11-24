@@ -44,8 +44,9 @@ def test_current_and_previous_cycles():
 
 def test_projection_scales_to_the_whole_cycle():
     current, _ = bill_estimates(HOURS, 23, NOW)
-    # $1/h over the 31-day 10/23-11/23 cycle
-    assert current.projected == pytest.approx(31 * 24 * 1.0)
+    # $1/h over the 10/23-11/23 cycle: 31 days plus the hour daylight saving
+    # gives back on 11/1.
+    assert current.projected == pytest.approx((31 * 24 + 1) * 1.0)
 
 
 def test_cycle_without_data():
@@ -75,7 +76,7 @@ def test_sensors_report_rounded_dollars_and_period():
         "data_through": "2026-10-29T23:59:59-05:00",
         "complete": False,
     }
-    assert make_sensor("projected_bill", data).native_value == 744.0
+    assert make_sensor("projected_bill", data).native_value == 745.0
     last = make_sensor("last_bill", data)
     assert last.native_value == 360.0
     assert last.extra_state_attributes["complete"] is True
