@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import logging
@@ -60,6 +61,7 @@ from .cost import (
     electricity_costs,
     fill_gaps,
     garbage_cost,
+    latest_completed_winter,
     water_costs,
     winter_average,
     winter_cycles,
@@ -92,6 +94,16 @@ class LusData:
     account_id: str
     current: BillEstimate
     previous: BillEstimate
+    winter_average: WinterAverageData
+
+
+@dataclass(frozen=True)
+class WinterAverageData:
+    """The account water meter's most recent completed winter average."""
+
+    year: int
+    water_meter_id: str | None
+    gallons: float | None
 
 # (start of the last stored hour, its running sum); (None, 0.0) if none stored.
 type LastStat = tuple[datetime | None, float]
@@ -135,12 +147,21 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         # (meter uuid, winter, its bills' cycles) -> average gallons per bill, or
         # None if the meter has no reads for it; kept once every bill is covered.
         self._winters: dict[tuple[str, int, tuple], float | None] = {}
+        # All results attempted during this update, including incomplete ones.
+        # This lets the sensor reuse a summer-tier lookup without a duplicate fetch.
+        self._winter_results: dict[tuple[str, int, tuple], tuple[float | None, bool]] = {}
+        # Incomplete results are retried while the latest winter can still settle,
+        # then retained so historical gaps do not trigger four requests per update.
+        self._settled_winter_results: dict[
+            tuple[str, int, tuple], tuple[float | None, bool]
+        ] = {}
         # meter uuid -> end of the newest bill period seen in a completed update.
         self._bill_ends: dict[str, datetime] = {}
         # The account's billing cycles as of the last update, for the options flow.
         self.cycles: BillingCycles | None = None
 
     async def _async_update_data(self) -> LusData | None:
+        self._winter_results = {}
         rates = RateSchedule.from_options(self.config_entry.options)
         # After rates change, costs from this point on are recomputed and
         # overwrite what's stored; earlier hours are left as they are.
@@ -181,6 +202,10 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
                 )
                 if meter_costs is not None:
                     costs.append(meter_costs)
+            today = dt_util.now(SITE_TZ).date()
+            winter_data = await self._async_account_winter_average(
+                meters, rates, today, meter_rates
+            )
         except LusAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
         except (LusError, aiohttp.ClientError, TimeoutError) as err:
@@ -198,7 +223,7 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
             current, previous = bill_estimates(
                 totals, account_rates.cycles, dt_util.now(SITE_TZ)
             )
-            data = LusData(self.client.account_id, current, previous)
+            data = LusData(self.client.account_id, current, previous, winter_data)
         self.cycles = account_rates.cycles
         self._bill_ends.update(bill_ends)
         if requested is not None:
@@ -329,28 +354,77 @@ class LusCoordinator(DataUpdateCoordinator[LusData | None]):
         hold_from = None
         for winter, first_hour in winters_needed(hours, rates).items():
             bills = tuple(winter_cycles(winter, cycles))
-            key = (meter.uuid, winter, bills)
-            if key in self._winters:
-                average = self._winters[key]
-            else:
-                average, complete = await self._async_read_winter(meter, bills, today)
-                winter_end = bills[-1][1]
-                if complete:
-                    # Anything less is read again on the next update.
-                    self._winters[key] = average
-                    _LOGGER.info(
-                        "Winter %s average for meter %s: %s gallons per bill",
-                        winter,
-                        meter.utility_account_id,
-                        "no data" if average is None else round(average),
-                    )
-                elif today - winter_end.date() <= WINTER_SETTLE:
-                    # The last winter bill's reads can lag a few days.
-                    hold_from = first_hour if hold_from is None else min(hold_from, first_hour)
-                    continue
+            average, complete = await self._async_winter_result(meter, winter, bills, today)
+            if not complete and today - bills[-1][1].date() <= WINTER_SETTLE:
+                # The last winter bill's reads can lag a few days.
+                hold_from = first_hour if hold_from is None else min(hold_from, first_hour)
+                continue
             if average is not None:
                 averages[winter] = average
         return averages, hold_from
+
+    async def _async_account_winter_average(
+        self,
+        meters: list[Meter],
+        rates: Rates | RateSchedule,
+        today: date,
+        meter_rates: Mapping[str, RateSchedule] | None = None,
+    ) -> WinterAverageData:
+        """Return the latest completed winter for the account's water meter,
+        over that meter's own winter bills."""
+        winter = latest_completed_winter(today)
+        meter = next((m for m in meters if m.fuel_type == FUEL_WATER), None)
+        if meter is None:
+            return WinterAverageData(winter, None, None)
+        cycles = as_schedule((meter_rates or {}).get(meter.uuid, rates)).cycles
+        bills = tuple(winter_cycles(winter, cycles))
+        average, complete = await self._async_winter_result(meter, winter, bills, today)
+        return WinterAverageData(
+            winter,
+            meter.utility_account_id,
+            average if complete else None,
+        )
+
+    async def _async_winter_result(
+        self,
+        meter: Meter,
+        winter: int,
+        bills: tuple[tuple[datetime, datetime], ...],
+        today: date,
+    ) -> tuple[float | None, bool]:
+        """Read a winter once per update and retain results once settled."""
+        key = (meter.uuid, winter, bills)
+        if key in self._winters:
+            return self._winters[key], True
+        settled_results = getattr(self, "_settled_winter_results", None)
+        if settled_results is None:
+            settled_results = self._settled_winter_results = {}
+        if key in settled_results:
+            return settled_results[key]
+        results = getattr(self, "_winter_results", None)
+        if results is None:
+            results = self._winter_results = {}
+        if key in results:
+            return results[key]
+        result = await self._async_read_winter(meter, bills, today)
+        results[key] = result
+        average, complete = result
+        if complete:
+            self._winters[key] = average
+            _LOGGER.info(
+                "Winter %s average for meter %s: %s gallons per bill",
+                winter,
+                meter.utility_account_id,
+                "no data" if average is None else round(average),
+            )
+        elif today - bills[-1][1].date() > WINTER_SETTLE:
+            settled_results[key] = result
+            _LOGGER.info(
+                "Winter %s reads for meter %s settled incomplete",
+                winter,
+                meter.utility_account_id,
+            )
+        return result
 
     async def _async_read_winter(
         self, meter: Meter, bills: tuple[tuple[datetime, datetime], ...], today: date
