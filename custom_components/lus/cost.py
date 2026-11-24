@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
+import math
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -15,24 +16,40 @@ from .api import HourlyUsage
 
 SITE_TZ = ZoneInfo("America/Chicago")
 
+# Schedule S1: summer wastewater is never charged on less than this share of
+# the water actually used.
+WASTEWATER_MIN_SHARE = 0.75
+
+# Bills whose average water use sets the next summer's tier-1 limit (W1, S1).
+WINTER_MONTHS = frozenset({12, 1, 2, 3})
+
+# A winter bill still counts toward the average with up to this much of its
+# cycle missing from the interval reads; its use is scaled up to the whole cycle.
+WINTER_COVERAGE_SLACK = timedelta(days=1)
+
 
 @dataclass(frozen=True)
 class Rates:
-    """Rates and fixed charges from an LUS bill. Defaults are the October 2026 bill."""
+    """Rates and fixed charges from an LUS bill. Defaults are the October 2026 bill,
+    apart from the tier-1 limit."""
 
     electric_energy_rate: float = 0.05224
     electric_fuel_adjustment_rate: float = 0.044
     electric_customer_charge: float = 13.00
     water_tier1_rate: float = 0.00209
     water_tier2_rate: float = 0.00331
-    water_tier1_gallons: float = 20470
+    # The household's average use over the previous December-March bills,
+    # which LUS recalculates each year. 0 works it out from the water meter.
+    water_tier1_gallons: float = 0
     water_customer_charge: float = 6.99
     water_state_fee: float = 1.00
     wastewater_rate: float = 0.00747
     wastewater_customer_charge: float = 11.29
-    # Billing months (by the month a cycle ends) where wastewater is not
-    # charged on water used above the tier-1 limit.
-    wastewater_summer_months: str = "5,6,7,8,9,10"
+    # Billing months (by the month a cycle ends) under the summer rules of LUS
+    # schedules W1 and S1: water above the tier-1 limit is charged at the
+    # tier-2 rate, and wastewater is capped at the tier-1 limit. Other months
+    # charge every gallon at the tier-1 rate and in full for wastewater.
+    wastewater_summer_months: str = "4,5,6,7,8,9,10,11"
     garbage_charge: float = 38.04
     # Day of the month the meters are read; billing cycles start at midnight on it.
     billing_day: int = 23
@@ -186,12 +203,16 @@ def electricity_costs(
 
 
 def water_costs(
-    hours: Iterable[HourlyUsage], rates: Rates | RateSchedule
+    hours: Iterable[HourlyUsage],
+    rates: Rates | RateSchedule,
+    winters: Mapping[int, float] | None = None,
 ) -> list[HourlyUsage]:
     """Cost per hour of water and wastewater, both billed from the water meter.
 
     Gallons count toward the tier-1 limit from the start of each billing cycle,
     so `hours` should begin at a cycle start for the tiers to come out right.
+    Where the rates leave the limit at 0, it's the average in `winters` for the
+    winter before the bill (see `winter_average`); with none, there are no tiers.
     """
     schedule = _as_schedule(rates)
     cycles = _Cycles(schedule.billing_day)
@@ -203,19 +224,108 @@ def water_costs(
         start, end = cycles.bounds(h.start)
         if start != cycle_start:
             cycle_start, used = start, 0.0
-        tier1 = max(0.0, min(h.value, r.water_tier1_gallons - used))
+        before, used = used, used + h.value
+
+        year, billed_month = _billed_month(end)
+        if billed_month in r.summer_months:
+            limit = r.water_tier1_gallons or (winters or {}).get(
+                _limit_winter(year, billed_month), math.inf
+            )
+            tier1 = max(0.0, min(h.value, limit - before))
+            sewer_gallons = _summer_sewer_gallons(used, limit) - _summer_sewer_gallons(
+                before, limit
+            )
+        else:
+            tier1 = sewer_gallons = h.value
         tier2 = h.value - tier1
-        used += h.value
 
         cost = tier1 * r.water_tier1_rate + tier2 * r.water_tier2_rate
-        # A cycle that ends at midnight on the 1st belongs to the prior month.
-        billed_month = (end - timedelta(seconds=1)).month
-        sewer_gallons = tier1 if billed_month in r.summer_months else h.value
         cost += sewer_gallons * r.wastewater_rate
         fixed = r.water_customer_charge + r.water_state_fee + r.wastewater_customer_charge
         cost += fixed / cycles.hours(h.start)
         costs.append(HourlyUsage(h.start, cost))
     return costs
+
+
+def _summer_sewer_gallons(used: float, limit: float) -> float:
+    """Wastewater gallons charged for `used` gallons so far in a summer cycle:
+    the tier-1 limit or actual use, whichever is less, but never less than
+    WASTEWATER_MIN_SHARE of actual use."""
+    return max(min(used, limit), WASTEWATER_MIN_SHARE * used)
+
+
+def _billed_month(cycle_end: datetime) -> tuple[int, int]:
+    """(year, month) of the bill for the cycle ending at `cycle_end`.
+
+    A cycle that ends at midnight on the 1st belongs to the prior month.
+    """
+    last = cycle_end - timedelta(seconds=1)
+    return last.year, last.month
+
+
+def _limit_winter(year: int, month: int) -> int | None:
+    """The winter, by the year of its March bill, whose average sets the tier-1
+    limit of the bill for `month` of `year`: that year's, for April-November.
+    None for a December-March bill, whose winter isn't over."""
+    return None if month in WINTER_MONTHS else year
+
+
+def winter_cycles(winter: int, billing_day: int) -> list[tuple[datetime, datetime]]:
+    """The cycles of the December-March bills of the winter whose March bill
+    falls in `winter`."""
+    months = ((winter - 1, 12), (winter, 1), (winter, 2), (winter, 3))
+    # The cycle holding the 1st of a month is the one billed in that month.
+    return [cycle_bounds(datetime(y, m, 1, tzinfo=SITE_TZ), billing_day) for y, m in months]
+
+
+def winter_average(
+    hours: Iterable[HourlyUsage], cycles: list[tuple[datetime, datetime]]
+) -> tuple[float | None, bool]:
+    """Average water use per bill over `cycles`, and whether `hours` covers
+    every one of them.
+
+    A cycle missing up to WINTER_COVERAGE_SLACK of its hours counts, its use
+    scaled up to the whole cycle: LUS bills from the meter's register, which
+    gaps in the interval reads don't lower. The average is over the cycles
+    covered, as LUS averages "such portion of said winter months as may have
+    been metered"; None if there are none.
+    """
+    # Hours are counted by instant, so DST changes don't throw the count off.
+    stamps: dict[datetime, set[float]] = {start: set() for start, _ in cycles}
+    gallons = dict.fromkeys(stamps, 0.0)
+    for h in hours:
+        for start, end in cycles:
+            if start <= h.start < end:
+                stamps[start].add(h.start.timestamp())
+                gallons[start] += h.value
+                break
+
+    covered = []
+    slack = WINTER_COVERAGE_SLACK / timedelta(hours=1)
+    for start, end in cycles:
+        whole = (end.timestamp() - start.timestamp()) / 3600
+        have = len(stamps[start])
+        if have and whole - have <= slack:
+            covered.append(gallons[start] * whole / have)
+    average = sum(covered) / len(covered) if covered else None
+    return average, len(covered) == len(cycles)
+
+
+def winters_needed(
+    hours: Iterable[HourlyUsage], rates: Rates | RateSchedule
+) -> dict[int, datetime]:
+    """Winters whose average sets the tier-1 limit of a summer bill in `hours`
+    whose rates leave the limit at 0, each with the first hour that needs it."""
+    schedule = _as_schedule(rates)
+    cycles = _Cycles(schedule.billing_day)
+    needed: dict[int, datetime] = {}
+    for h in hours:
+        r = schedule.at(h.start)
+        year, month = _billed_month(cycles.bounds(h.start)[1])
+        winter = _limit_winter(year, month)
+        if month in r.summer_months and not r.water_tier1_gallons and winter is not None:
+            needed[winter] = min(needed.get(winter, h.start), h.start)
+    return needed
 
 
 def garbage_cost(hour: datetime, rates: Rates | RateSchedule) -> float:

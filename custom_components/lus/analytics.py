@@ -12,10 +12,10 @@ formula used here is written out, with a worked example, in docs/MATH.md.
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from datetime import date, datetime, timedelta, timezone
-from math import sqrt
+from math import inf, sqrt
 from statistics import median
 from typing import Any
 
@@ -25,10 +25,16 @@ from .cost import (
     Rates,
     RateSchedule,
     _as_schedule,
+    _billed_month,
     _Cycles,
     _cycle_start,
+    _limit_winter,
+    _summer_sewer_gallons,
     cycle_bounds,
     elapsed_hours,
+    winter_average,
+    winter_cycles,
+    winters_needed,
 )
 
 ELECTRICITY = "electricity"
@@ -169,11 +175,14 @@ def electricity_charges(
 
 
 def water_charges(
-    hours: Iterable[HourlyUsage], rates: Rates | RateSchedule
+    hours: Iterable[HourlyUsage],
+    rates: Rates | RateSchedule,
+    winters: Mapping[int, float] | None = None,
 ) -> list[Charges]:
     """The parts of `cost.water_costs`, hour by hour.
 
-    As there, `hours` must be in order and should begin at a cycle start.
+    As there, `hours` must be in order and should begin at a cycle start, and
+    `winters` gives the tier-1 limit where the rates leave it at 0.
     """
     schedule = _as_schedule(rates)
     cycles = _Cycles(schedule.billing_day)
@@ -185,11 +194,20 @@ def water_charges(
         start, end = cycles.bounds(h.start)
         if start != cycle_start:
             cycle_start, used = start, 0.0
-        tier1 = max(0.0, min(h.value, r.water_tier1_gallons - used))
+        before, used = used, used + h.value
+
+        year, billed_month = _billed_month(end)
+        if billed_month in r.summer_months:
+            limit = r.water_tier1_gallons or (winters or {}).get(
+                _limit_winter(year, billed_month), inf
+            )
+            tier1 = max(0.0, min(h.value, limit - before))
+            sewer_gallons = _summer_sewer_gallons(used, limit) - _summer_sewer_gallons(
+                before, limit
+            )
+        else:
+            tier1 = sewer_gallons = h.value
         tier2 = h.value - tier1
-        used += h.value
-        billed_month = (end - timedelta(seconds=1)).month
-        sewer_gallons = tier1 if billed_month in r.summer_months else h.value
         cycle_hours = cycles.hours(h.start)
         charges.append(
             Charges(
@@ -202,6 +220,20 @@ def water_charges(
     return charges
 
 
+def winter_averages(
+    hours: Sequence[HourlyUsage], rates: Rates | RateSchedule
+) -> dict[int, float]:
+    """The December-March averages that set the tier-1 limit of the summer
+    bills in `hours`, worked out from `hours` themselves where they cover them."""
+    billing_day = _as_schedule(rates).billing_day
+    averages = {}
+    for winter in winters_needed(hours, rates):
+        average, _ = winter_average(hours, winter_cycles(winter, billing_day))
+        if average is not None:
+            averages[winter] = average
+    return averages
+
+
 def cycle_charges(
     kwh: float | None,
     gallons: float | None,
@@ -209,12 +241,15 @@ def cycle_charges(
     billed_month: int,
     electric_meters: int = 1,
     water_meters: int = 1,
+    tier1_limit: float | None = None,
 ) -> Charges:
     """The bill for one whole billing cycle from its total usage.
 
     Pass None for a utility the account doesn't have. `billed_month` is the
-    month the cycle ends in, which decides the summer wastewater discount.
-    Each meter carries its own fixed charges and, for water, its own tier-1
+    month the cycle ends in, which decides whether the summer rules apply:
+    tiered water, and wastewater capped at the tier-1 limit but never under
+    75% of use. `tier1_limit` is the winter average, used where the rates
+    leave the limit at 0; with neither there are no tiers. Each meter carries its own fixed charges and, for water, its own tier-1
     allowance; with more than one water meter the gallons are taken as split
     evenly between them.
     """
@@ -226,7 +261,9 @@ def cycle_charges(
             electric_fixed=rates.electric_customer_charge * electric_meters,
         )
     if gallons is not None and water_meters > 1:
-        each = cycle_charges(None, gallons / water_meters, rates, billed_month)
+        each = cycle_charges(
+            None, gallons / water_meters, rates, billed_month, tier1_limit=tier1_limit
+        )
         charges += Charges(
             water_volume=each.water_volume * water_meters,
             water_fixed=each.water_fixed * water_meters,
@@ -234,9 +271,13 @@ def cycle_charges(
             wastewater_fixed=each.wastewater_fixed * water_meters,
         )
     elif gallons is not None:
-        tier1 = min(gallons, rates.water_tier1_gallons)
+        if billed_month in rates.summer_months:
+            limit = rates.water_tier1_gallons or tier1_limit or inf
+            tier1 = min(gallons, limit)
+            sewer = _summer_sewer_gallons(gallons, limit)
+        else:
+            tier1 = sewer = gallons
         tier2 = gallons - tier1
-        sewer = tier1 if billed_month in rates.summer_months else gallons
         charges += Charges(
             water_volume=tier1 * rates.water_tier1_rate + tier2 * rates.water_tier2_rate,
             water_fixed=rates.water_customer_charge + rates.water_state_fee,
@@ -324,7 +365,15 @@ class PeriodSummary:
 class Ledger:
     """Hour records in time order, with fast sums over any span."""
 
-    def __init__(self, records: Iterable[HourRecord], fuels: Iterable[str]) -> None:
+    def __init__(
+        self,
+        records: Iterable[HourRecord],
+        fuels: Iterable[str],
+        winters: Mapping[int, float] | None = None,
+    ) -> None:
+        # Winter average per water meter, by the year of the winter's March
+        # bill: the tier-1 limit of that year's summer bills.
+        self.winters = dict(winters or {})
         self.records = sorted(records, key=lambda r: r.start)
         self._stamps = [r.start.timestamp() for r in self.records]
         fuels = list(fuels)
@@ -344,6 +393,10 @@ class Ledger:
     @property
     def first(self) -> datetime | None:
         return self.records[0].start if self.records else None
+
+    def tier1_limit(self, cycle_end: datetime) -> float | None:
+        """The winter average that applies to the bill for a cycle, if known."""
+        return self.winters.get(_limit_winter(*_billed_month(cycle_end)))
 
     def between(self, start: datetime, end: datetime) -> list[HourRecord]:
         lo = bisect_left(self._stamps, start.timestamp())
@@ -377,11 +430,14 @@ class Ledger:
 
 
 def build_ledger(
-    series: Iterable[tuple[str, Iterable[HourlyUsage]]], rates: Rates | RateSchedule
+    series: Iterable[tuple],
+    rates: Rates | RateSchedule,
 ) -> Ledger:
     """Cost out each meter's hours and line them up by hour.
 
-    `series` holds (fuel type, hourly usage) for each billed meter. Garbage is
+    `series` holds (fuel type, hourly usage) for each billed meter. A water
+    meter may add a third item, its known winter averages by year; winters not
+    given are worked out from the meter's own hours. Garbage is
     charged to the hours every meter has reported, as the total cost statistic
     does. Over those hours the ledger's total equals that statistic; an hour
     only some meters have reported keeps their charges here, as their own cost
@@ -391,16 +447,19 @@ def build_ledger(
     usage: dict[datetime, list[float | None]] = {}
     charged: dict[datetime, list[Charges]] = {}
     fuels: list[str] = []
-    for fuel, hours in series:
+    winters: list[dict[int, float]] = []
+    for fuel, hours, *known in series:
+        hours = sorted(hours, key=lambda h: h.start)
         if fuel == FUEL_ELECTRICITY:
-            slot, charge_fn = 0, electricity_charges
+            slot, itemised = 0, electricity_charges(hours, rates)
         elif fuel == FUEL_WATER:
-            slot, charge_fn = 1, water_charges
+            meter_winters = {**winter_averages(hours, rates), **(known[0] if known else {})}
+            winters.append(meter_winters)
+            slot, itemised = 1, water_charges(hours, rates, meter_winters)
         else:
             continue
-        hours = sorted(hours, key=lambda h: h.start)
         fuels.append(fuel)
-        for h, charges in zip(hours, charge_fn(hours, rates)):
+        for h, charges in zip(hours, itemised):
             values = usage.setdefault(h.start, [None, None])
             values[slot] = (values[slot] or 0.0) + h.value
             charged.setdefault(h.start, []).append(charges)
@@ -427,7 +486,12 @@ def build_ledger(
                 complete,
             )
         )
-    return Ledger(records, fuels)
+    # With several water meters, forecasts use the mean of their averages.
+    years = {year for meter in winters for year in meter}
+    limits = {
+        year: sum(v := [m[year] for m in winters if year in m]) / len(v) for year in years
+    }
+    return Ledger(records, fuels, limits)
 
 
 # --- Periods -----------------------------------------------------------------
@@ -872,10 +936,6 @@ class Forecast:
         }
 
 
-def _billed_month(cycle_end: datetime) -> int:
-    return (cycle_end - timedelta(seconds=1)).month
-
-
 def _forecast_from_usage(
     start: datetime,
     end: datetime,
@@ -887,16 +947,17 @@ def _forecast_from_usage(
     days_projected: float,
     factors: dict[str, float],
     meters: tuple[int, int] = (1, 1),
+    tier1_limit: float | None = None,
 ) -> Forecast:
     """Price expected usage and the usage one spread either side of it."""
-    month = _billed_month(end)
+    month = _billed_month(end)[1]
 
     def bill(direction: int) -> Charges:
         kwh, gallons = (
             None if value is None else max(low, value + direction * width)
             for value, width, low in zip(expected, spread, floor)
         )
-        return cycle_charges(kwh, gallons, rates, month, *meters)
+        return cycle_charges(kwh, gallons, rates, month, *meters, tier1_limit)
 
     return Forecast(
         cycle_start=start,
@@ -968,6 +1029,7 @@ def forecast_current_cycle(
         missing_days,
         factors,
         (ledger.electric_meters, ledger.water_meters),
+        ledger.tier1_limit(end),
     )
 
 
@@ -1061,6 +1123,7 @@ def forecast_next_cycle(
         days,
         applied,
         (ledger.electric_meters, ledger.water_meters),
+        ledger.tier1_limit(end),
     )
 
 

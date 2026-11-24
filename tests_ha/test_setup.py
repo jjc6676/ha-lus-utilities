@@ -19,17 +19,19 @@ from homeassistant.util import dt as dt_util
 
 from custom_components.lus.api import Meter, Read
 from custom_components.lus.const import DOMAIN
+from custom_components.lus.cost import Rates
 
 CDT = timezone(timedelta(hours=-5))
 ACCOUNT = "5000000000"
 METERS = [
     Meter("elec-uuid", "1000000001", "ELECTRICITY", "QUARTER_HOUR", date(2026, 9, 23)),
-    Meter("water-uuid", "1000000002", "WATER", "HOUR", date(2026, 9, 23)),
+    # A year earlier, so last winter's bills set the water tier-1 limit.
+    Meter("water-uuid", "1000000002", "WATER", "HOUR", date(2025, 9, 23)),
 ]
 
 
 class FakeClient:
-    """Every meter reports a steady flow from 9/23 through 10/29."""
+    """Every meter reports a steady flow from its first read through 10/29/2026."""
 
     account_id = ACCOUNT
 
@@ -97,12 +99,15 @@ async def test_setup_creates_bill_sensors_and_statistics(
     assert last.attributes["period_start"] == "2026-09-23"
     assert last.attributes["complete"] is True
 
-    # Default rates, 9/23-10/23: electric 2 kWh/h and water 30 gal/h for 30 days
+    # Default rates, 9/23-10/23: electric 2 kWh/h and water 30 gal/h for 30 days.
+    # The water tier-1 limit is the meter's December-March average: 30 gal for
+    # each hour of those bills' cycles, March's losing one to DST.
     kwh, gallons = 2 * 24 * 30, 30 * 24 * 30
+    limit = 30 * (720 + 744 + 744 + 671) / 4
     expected = (
         kwh * 0.09624 + 13.00
-        + 20470 * 0.00209 + (gallons - 20470) * 0.00331
-        + 20470 * 0.00747  # October is a summer-discount month
+        + limit * 0.00209 + (gallons - limit) * 0.00331
+        + limit * 0.00747  # October is a summer-discount month
         + 6.99 + 1.00 + 11.29 + 38.04
     )
     assert float(last.state) == pytest.approx(expected, abs=0.01)
@@ -164,10 +169,16 @@ async def test_history_is_read_back_from_statistics_after_a_restart(
         await hass.async_block_till_done()
     again = entry.runtime_data.data.insights
 
-    assert again.months[0].label == first.months[0].label == "2026-09"
-    assert again.months[0].kwh == pytest.approx(first.months[0].kwh)
-    assert again.months[0].gallons == pytest.approx(first.months[0].gallons)
-    assert again.months[0].kwh == pytest.approx(2.0 * 24 * 8)
+    def month(insights, label):
+        return next(m for m in insights.months if m.label == label)
+
+    # Water has a year of history and electricity starts 9/23/2026.
+    assert again.months[0].label == first.months[0].label == "2025-09"
+    for label in ("2026-01", "2026-09"):
+        assert month(again, label).kwh == pytest.approx(month(first, label).kwh)
+        assert month(again, label).gallons == pytest.approx(month(first, label).gallons)
+    assert month(again, "2026-01").gallons == pytest.approx(30.0 * 24 * 31)
+    assert month(again, "2026-09").kwh == pytest.approx(2.0 * 24 * 8)
 
 
 async def test_failed_sign_in_does_not_put_the_password_back_in_the_form(
@@ -193,3 +204,26 @@ async def test_failed_sign_in_does_not_put_the_password_back_in_the_form(
         for key in result["data_schema"].schema
     }
     assert suggested == {"username": "someone", "password": None}
+
+
+async def test_upgrade_from_040_moves_summer_months_and_recalculates(
+    recorder_mock: Recorder, hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    freezer.move_to("2026-10-31T14:00:00+00:00")
+    hass.config.currency = "USD"
+    saved = {"effective_from": None, **Rates(wastewater_summer_months="5,6,7,8,9,10").as_options()}
+    entry = MockConfigEntry(
+        domain=DOMAIN, unique_id=ACCOUNT, title=f"LUS account {ACCOUNT}",
+        data={"username": "user", "password": "pw"},
+        options={"rate_schedule": [saved]}, minor_version=1,
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.lus.coordinator.LusClient", FakeClient):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.minor_version == 3
+    assert entry.options["rate_schedule"][0]["wastewater_summer_months"] == "4,5,6,7,8,9,10,11"
+    # The first update recomputed every stored cost and cleared the request.
+    assert "recalculate_from" not in entry.options

@@ -11,7 +11,7 @@ as `tests/test_analytics.py`, so every example here is also a passing test.
 | `r_f` | Electric fuel adjustment, $/kWh | 0.04400 |
 | `C_e` | Electric customer charge, $/cycle | 13.00 |
 | `r_1`, `r_2` | Water tier 1 and tier 2 rates, $/gal | 0.00209, 0.00331 |
-| `T` | Water tier 1 limit, gal/cycle | 20,470 |
+| `T` | Water tier 1 limit, gal/cycle: your average over the previous December to March bills | 20,470 on that bill |
 | `C_w` | Water customer charge, $/cycle | 6.99 |
 | `S` | State safe drinking water fee, $/cycle | 1.00 |
 | `r_s` | Wastewater volume charge, $/gal | 0.00747 |
@@ -27,9 +27,13 @@ adjustment, the three customer charges, the state fee and garbage.
 For a cycle with `E` kWh and `W` gallons:
 
 ```
-tier1 = min(W, T)                      gallons billed at tier 1
-tier2 = W - tier1                      gallons billed at tier 2
-sewer = tier1  in a summer-discount billing month, otherwise W
+In an April to November bill (LUS schedules W1 and S1):
+  tier1 = min(W, T)                    gallons billed at tier 1
+  tier2 = W - tier1                    gallons billed at tier 2
+  sewer = max(min(W, T), 0.75 × W)     wastewater gallons: capped at the limit,
+                                       but never under 75% of use
+In a December to March bill:
+  tier1 = W        tier2 = 0        sewer = W
 
 electricity = E × (r_e + r_f) + C_e
 water       = tier1 × r_1 + tier2 × r_2 + C_w + S
@@ -37,11 +41,15 @@ wastewater  = sewer × r_s + C_s
 total       = electricity + water + wastewater + G
 ```
 
-**Example: the October 2026 bill**, `E` = 2,147 kWh and `W` = 21,300 gal,
-October being a summer-discount month:
+`T` is whatever limit you entered with your rates. Left at 0, it is worked out
+from the water meter: the mean gallons per bill over the previous December to
+March bills. With no limit and no winter data, a summer bill has no tiers.
+
+**Example: the October 2026 bill**, `E` = 2,147 kWh and `W` = 21,300 gal:
 
 ```
-tier1 = min(21,300, 20,470) = 20,470      tier2 = 830      sewer = 20,470
+tier1 = min(21,300, 20,470) = 20,470      tier2 = 830
+sewer = max(20,470, 0.75 × 21,300 = 15,975) = 20,470
 
 electricity = 2,147 × 0.05224 + 2,147 × 0.04400 + 13.00
             = 112.16 + 94.47 + 13.00                      = $219.63
@@ -68,7 +76,8 @@ garbage(h)     = G / H
 ```
 
 `tier1(h)` is the part of the hour's gallons that still fits under `T`, counting
-gallons from the start of the cycle. `H` is the cycle's real length, so a fixed
+gallons from the start of the cycle, and `sewer(h)` is the amount by which the
+hour raises the cycle's wastewater gallons. `H` is the cycle's real length, so a fixed
 charge spread over all of a cycle's hours adds back up to exactly the charge.
 A cycle that contains the November clock change has one hour more than its days
 × 24 and one that contains the March change has one less: 23 October to 23
@@ -186,9 +195,9 @@ fixed charges     = 68.66 - 70.32                                =  -$1.66
                                                            total = +$52.23
 ```
 
-The water rate effect is negative because September passed the tier 1 limit in
-a summer month: gallons above it carry no wastewater charge, which lowers the
-average cost per gallon.
+The water rate effect is negative because September passed the tier 1 limit:
+gallons above it carry no wastewater charge (until 75% of use overtakes the
+limit), which lowers the average cost per gallon.
 
 ### To date
 
@@ -258,7 +267,8 @@ low, high usage = expected ∓ spread             never below A
 ```
 
 Expected, low and high usage for electricity and water are then each priced with
-the whole-cycle bill of section 1 (with one set of fixed charges per meter if
+the whole-cycle bill of section 1, using the winter average for the cycle's
+year as `T` when the rates leave it at 0 (and with one set of fixed charges per meter if
 the account has more than one meter of a kind). Pricing the cycle's usage as a whole, rather
 than scaling up the cost so far, is what puts tier 2 water, the summer
 wastewater discount and the full fixed charges in the right place.
@@ -276,10 +286,10 @@ spread       = 1.2816 × 6 × sqrt(24.04)          = 37.7 kWh
 
 electricity  = 1,685.0 × 0.09624 + 13.00         = $175.16
 water        = 20,470 × 0.00209 + 1,018.8 × 0.00331 + 7.99 = $54.14
-wastewater   = 21,488.8 × 0.00747 + 11.29        = $171.81   (November: no discount)
+wastewater   = max(20,470, 0.75 × 21,488.8) × 0.00747 + 11.29 = $164.20
 garbage                                          = $38.04
-forecast                                         = $439.16
-range        = $425.37 to $452.95
+forecast                                         = $431.55
+range        = $424.80 to $438.30
 ```
 
 ### The next bill
@@ -303,8 +313,8 @@ for electricity and 3% below for water.
 kWh          = 1,250 × 1.08                      = 1,350
 gallons      = 19,800 × 0.97                     = 19,206
 electricity  = 1,350 × 0.09624 + 13.00           = $142.92
-water        = 19,206 × 0.00209 + 7.99           = $48.13
-wastewater   = 19,206 × 0.00747 + 11.29          = $154.76
+water        = 19,206 × 0.00209 + 7.99           = $48.13    (December: no tiers)
+wastewater   = 19,206 × 0.00747 + 11.29          = $154.76   (every gallon)
 garbage                                          = $38.04
 forecast                                         = $383.85
 ```

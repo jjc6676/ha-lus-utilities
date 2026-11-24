@@ -8,11 +8,11 @@ which has its own login and API path. This integration talks to it directly.
 
 > **Disclaimer:** This is an unofficial, independent project. It is not
 > affiliated with, endorsed by, or supported by Lafayette Utilities System
-> (LUS), the Lafayette Utilities Authority, or Opower/Oracle. The LUS name and
-> logo belong to their owner and are used only to identify the utility. Cost
-> figures are estimates; your LUS bill is the authoritative amount. The
-> integration reads the same customer portal you sign in to, so changes to that
-> portal may break it.
+> (LUS), the Lafayette Utilities Authority, or Opower/Oracle. The LUS name
+> belongs to its owner and is used only to identify the utility; the
+> integration's icon is a generic design. Cost figures are estimates; your LUS
+> bill is the authoritative amount. The integration reads the same customer
+> portal you sign in to, so changes to that portal may break it.
 
 ## What it imports
 
@@ -48,12 +48,39 @@ from your bill's rates and adds three more statistics:
 - Monthly fixed charges are spread evenly over the real hours of each billing
   cycle, so a cycle that spans a clock change (745 or 743 hours for 31 days)
   still adds up to exactly the charge.
+- Water and wastewater follow LUS rate schedules W1 and S1. In April–November
+  bills, water above the tier-1 limit is charged at the tier-2 rate, and
+  wastewater is charged on the tier-1 limit or actual use, whichever is less
+  (the bill's "Summer Discount" line), but never on less than 75% of actual
+  use. December–March bills charge every gallon at the tier-1 rate and all of
+  it for wastewater.
+- The tier-1 limit is the household's average water use over the previous
+  December–March bills, which LUS recalculates each year. By default (a limit
+  of 0 in the options) the integration works it out from the water meter's
+  reads for those bills and logs it ("Winter 2026 average for meter …") so
+  you can compare it with your bill. Home Assistant hides info-level logs
+  by default; to see the line, add this to `configuration.yaml` and restart:
+
+  ```yaml
+  logger:
+    default: warning
+    logs:
+      custom_components.lus: info
+  ```
+
+  A bill missing up to a day of reads is
+  scaled up to its whole cycle; one missing more is left out of the average.
+  Until the March bill's reads are all in (at most a week), the cost of later
+  hours waits for them. With no reads from that winter, summer bills have no
+  tiers and are charged wastewater on every gallon.
+- To use your bill's tier-1 limit instead, enter it in the options. It then
+  applies to later summers too, until a later set of rates changes it, so
+  update it when LUS recalculates it or set it back to 0.
 - Water tiers reset at the start of each billing cycle (midnight on the meter
   read day, the 23rd by default).
-- In summer billing months, wastewater isn't charged on gallons above the
-  tier-1 limit, matching the bill's "Summer Discount" line.
-- Checked against the October 2026 bill: the model reproduces its $475.39 in
-  current charges to within a cent when usage is spread across the cycle.
+- Checked against the October 2026 bill: with that bill's tier-1 limit of
+  20,470 gallons, the model reproduces its $475.39 in current charges to
+  within a cent when usage is spread across the cycle.
 
 **Using it in the Energy dashboard:** on the LUS electricity entry choose
 "Use an entity tracking the total costs" and pick `LUS electricity cost …`; do
@@ -158,14 +185,19 @@ usage isn't touched. Hours before the earliest dated set use the original,
 undated rates (the October 2026 bill unless you changed them), so backfilled
 history before your first bill entry is only approximate.
 
+**Upgrading from 0.4.0:** sets of rates still holding 0.4.0's guessed summer
+months (May–October) move to April–November, and every stored cost is
+recalculated on the first update under the corrected water and wastewater
+rules. Months you changed yourself are kept. A tier-1 limit saved with your
+rates (20,470 gallons unless you changed it) is kept too; set it to 0 to have
+it worked out from the meter.
+
 **Not modeled:** taxes (currently $0 on the bill, so effective rates include
 every fee but no tax), late fees, payments and
-credits, and any change in the tier-1 limit between cycles. The tier-1 limit
-of 20,470 gallons is taken from the October bill; if LUS prorates it by cycle
-length, months with a different number of days will be slightly off. Which
-months get the summer wastewater discount is a guess (May–October) apart
-from October, which the bill confirms; adjust it in the options if a bill shows
-otherwise.
+credits, and any adjustment LUS makes to a winter average for unusual
+weather. The worked-out winter average assumes each cycle runs from midnight
+on the meter read day; if LUS reads a few days early or late, enter the
+figure from your bill.
 
 ## Install
 

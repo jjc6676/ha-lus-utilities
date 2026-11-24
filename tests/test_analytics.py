@@ -22,7 +22,8 @@ from custom_components.lus.cost import (
 )
 
 UTC = timezone.utc
-RATES = Rates()
+# The tier-1 limit on that bill, which newer versions otherwise work out from the meter.
+RATES = Rates(water_tier1_gallons=20470)
 
 # The October 2026 bill: read 09/23, read 10/23, 2,147 kWh and 21,300 gallons.
 OCT_START = datetime(2026, 9, 23, tzinfo=SITE_TZ)
@@ -101,6 +102,8 @@ def test_cycle_charges_reproduce_the_october_bill():
 def test_cycle_charges_without_the_summer_discount_or_a_water_meter():
     winter = an.cycle_charges(BILL_KWH, BILL_GALLONS, RATES, billed_month=1)
     assert winter.wastewater == pytest.approx(164.20 + 830 * 0.00747, abs=0.005)
+    # December-March bills have no tier 2 either.
+    assert winter.water == pytest.approx(21300 * 0.00209 + 7.99)
 
     electric_only = an.cycle_charges(BILL_KWH, None, RATES, billed_month=10)
     assert electric_only.total == pytest.approx(219.63 + 38.04, abs=0.005)
@@ -670,10 +673,10 @@ def test_math_example_forecast_this_cycle():
     assert round(forecast.kwh, 1) == 1685.0 and round(forecast.gallons, 1) == 21488.8
     c = forecast.charges
     assert [round(v, 2) for v in (c.electricity, c.water, c.wastewater, c.garbage)] == [
-        175.16, 54.14, 171.81, 38.04,
+        175.16, 54.14, 164.20, 38.04,
     ]
-    assert round(forecast.total, 2) == 439.16
-    assert (round(forecast.low, 2), round(forecast.high, 2)) == (425.37, 452.95)
+    assert round(forecast.total, 2) == 431.55
+    assert (round(forecast.low, 2), round(forecast.high, 2)) == (424.80, 438.30)
 
 
 def test_math_example_next_bill():
@@ -776,7 +779,7 @@ def test_forecast_charges_each_meter_its_own_fixed_charges():
     )
     forecast = an.forecast_current_cycle(ledger, RATES, NOW)
     assert forecast.charges.electric_fixed == pytest.approx(26.00)
-    two_water = an.cycle_charges(None, 30000, RATES, 1, water_meters=2)
+    two_water = an.cycle_charges(None, 30000, RATES, 10, water_meters=2)
     # 15,000 gal on each meter stays in tier 1; one meter would not.
     assert two_water.water_volume == pytest.approx(30000 * 0.00209)
     assert two_water.water_fixed == pytest.approx(2 * 7.99)
@@ -804,3 +807,54 @@ def test_season_decides_between_cooling_and_heating():
 
 def test_year_before_handles_leap_day():
     assert an._year_before(date(2028, 2, 29)) == date(2027, 2, 28)
+
+
+# --- Water schedules W1 and S1 -----------------------------------------------
+
+
+def test_summer_wastewater_is_never_charged_on_under_three_quarters_of_use():
+    # 40,000 gal against a 20,470 limit: 75% of use is more than the limit.
+    charges = an.cycle_charges(None, 40000, RATES, billed_month=8)
+    assert charges.wastewater_volume == pytest.approx(0.75 * 40000 * 0.00747)
+    assert charges.water_volume == pytest.approx(20470 * 0.00209 + 19530 * 0.00331)
+
+
+def test_tier_limit_comes_from_the_winter_average_when_the_rates_leave_it_out():
+    automatic = Rates()
+    assert automatic.water_tier1_gallons == 0
+    # Without a winter average there are no tiers and no discount.
+    plain = an.cycle_charges(None, 30000, automatic, billed_month=8)
+    assert plain.water_volume == pytest.approx(30000 * 0.00209)
+    assert plain.wastewater_volume == pytest.approx(30000 * 0.00747)
+    known = an.cycle_charges(None, 30000, automatic, billed_month=8, tier1_limit=20000)
+    assert known.water_volume == pytest.approx(20000 * 0.00209 + 10000 * 0.00331)
+    assert known.wastewater_volume == pytest.approx(0.75 * 30000 * 0.00747)
+
+
+def test_ledger_works_out_the_winter_average_and_matches_the_cost_model():
+    # 25 gal/h through last winter, 45 gal/h since: summer bills pass the limit.
+    start = local(2025, 11, 23)
+    water = series(start, STEADY_END, usage_step(local(2026, 4, 23), 25.0, 45.0))
+    automatic = Rates()
+    ledger = ledger_of(series(start, STEADY_END, 2.0), water, automatic)
+
+    limit = 25 * (720 + 744 + 744 + 671) / 4
+    assert ledger.winters == {2026: pytest.approx(limit)}
+    assert ledger.tier1_limit(OCT_END) == pytest.approx(limit)
+    assert ledger.tier1_limit(local(2026, 1, 23)) is None  # a winter bill has no tiers
+
+    expected = water_costs(water, automatic, {2026: limit})
+    for record, cost in zip(ledger.records, expected):
+        c = record.charges
+        assert c.water + c.wastewater == pytest.approx(cost.value, abs=1e-12)
+    october = ledger.span(OCT_START, OCT_END, "").charges
+    gallons = 45.0 * 720
+    assert october.water_volume == pytest.approx(limit * 0.00209 + (gallons - limit) * 0.00331)
+    assert october.wastewater_volume == pytest.approx(0.75 * gallons * 0.00747)
+
+    # A winter average read from the portal takes precedence.
+    given = an.build_ledger([(FUEL_WATER, water, {2026: 20000.0})], automatic)
+    assert given.winters == {2026: 20000.0}
+
+    forecast = an.forecast_current_cycle(ledger, automatic, NOW)
+    assert forecast.charges.wastewater_volume == pytest.approx(0.75 * forecast.gallons * 0.00747)

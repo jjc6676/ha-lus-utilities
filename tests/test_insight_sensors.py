@@ -11,6 +11,8 @@ from custom_components.lus.cost import SITE_TZ, Rates, bill_estimates
 from custom_components.lus.sensor import INSIGHT_SENSORS, SENSORS, LusInsightSensor
 
 UTC = timezone.utc
+# The October 2026 bill, with its tier-1 limit.
+RATES = Rates(water_tier1_gallons=20470)
 ACCOUNT = "5000000000"
 ELECTRIC = Meter("elec-uuid", "1000000001", "ELECTRICITY", "QUARTER_HOUR", date(2025, 7, 1))
 WATER = Meter("water-uuid", "1000000002", "WATER", "HOUR", date(2025, 7, 1))
@@ -39,9 +41,9 @@ def insights() -> an.Insights:
             ("ELECTRICITY", series(START, END, lambda t: 2.0)),
             ("WATER", series(START, END, gallons)),
         ],
-        Rates(),
+        RATES,
     )
-    return an.build_insights(ledger, Rates(), NOW)
+    return an.build_insights(ledger, RATES, NOW)
 
 
 def make_sensor(key: str, insights: an.Insights | None, with_data: bool = True):
@@ -153,9 +155,9 @@ def test_anomaly_sensor(insights):
             ("ELECTRICITY", series(START, END, lambda t: 2.0 + (20.0 if (t.date(), t.hour) == (date(2026, 10, 20), 18) else 0.0))),
             ("WATER", series(START, END, gallons)),
         ],
-        Rates(),
+        RATES,
     )
-    sensor = make_sensor("usage_anomalies", an.build_insights(ledger, Rates(), NOW))
+    sensor = make_sensor("usage_anomalies", an.build_insights(ledger, RATES, NOW))
     assert sensor.native_value == 1
     attributes = sensor.extra_state_attributes
     assert attributes["latest_date"] == "2026-10-20"
@@ -175,7 +177,7 @@ def test_sensors_are_unknown_without_insights():
 
 
 def test_sensors_cope_with_an_empty_history():
-    empty = an.build_insights(an.build_ledger([], Rates()), Rates(), NOW)
+    empty = an.build_insights(an.build_ledger([], RATES), RATES, NOW)
     for description in INSIGHT_SENSORS:
         sensor = make_sensor(description.key, empty)
         assert sensor.native_value in (None, 0)
@@ -212,6 +214,7 @@ def harness(monkeypatch):
         c = object.__new__(coord.LusCoordinator)
         c.hass = Hass()
         c._history = {}
+        c._winters = {}
         return c
 
     return SimpleNamespace(make=make, stored=stored, queries=queries)
@@ -237,7 +240,7 @@ async def test_insights_join_stored_history_to_the_fresh_hours(harness):
     }
 
     c = harness.make()
-    insights = await c._async_insights(fresh, Rates())
+    insights = await c._async_insights(fresh, RATES)
 
     # Hours before the fetch came from statistics, in the meter's own units.
     stat_id, start, end, period, units, types = harness.queries[0]
@@ -251,7 +254,7 @@ async def test_insights_join_stored_history_to_the_fresh_hours(harness):
 
     # Later updates reuse the history instead of reading statistics again.
     harness.queries.clear()
-    again = await c._async_insights(fresh, Rates())
+    again = await c._async_insights(fresh, RATES)
     assert harness.queries == []
     assert again.this_year.total == pytest.approx(insights.this_year.total)
 
@@ -273,7 +276,7 @@ async def test_history_is_trimmed_to_the_insight_window(harness):
     old = NOW - coord.INSIGHTS_HISTORY - timedelta(days=5)
     c = harness.make()
     c._history[ELECTRIC.uuid] = {old.astimezone(UTC): 9.0}
-    await c._async_insights({ELECTRIC: series(END - timedelta(days=2), END, lambda t: 2.0)}, Rates())
+    await c._async_insights({ELECTRIC: series(END - timedelta(days=2), END, lambda t: 2.0)}, RATES)
     assert min(c._history[ELECTRIC.uuid]) >= NOW - coord.INSIGHTS_HISTORY
 
 
@@ -284,5 +287,5 @@ async def test_a_failed_analysis_does_not_fail_the_update(harness, monkeypatch, 
     monkeypatch.setattr(coord, "_build_insights", broken)
     c = harness.make()
     fresh = {ELECTRIC: series(END - timedelta(days=2), END, lambda t: 2.0)}
-    assert await c._async_insights(fresh, Rates()) is None
+    assert await c._async_insights(fresh, RATES) is None
     assert "Could not work out LUS spending insights" in caplog.text
